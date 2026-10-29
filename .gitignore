@@ -1,0 +1,23 @@
+# videos and rendered output - never uploaded
+input/
+output/
+backup/
+converted/
+published/
+
+# local layout tuning (personal per-machine settings)
+layout.json
+
+# python
+__pycache__/
+*.py[cod]
+
+# virtual environments
+.venv/
+venv/
+
+# editors / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

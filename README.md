@@ -1,0 +1,187 @@
+# YTShortMaker
+
+Turns already-cropped Steam gameplay videos into **YouTube Shorts** (9:16) with one command:
+
+- a **~1:1 crop** of the gameplay, centered in the middle of the frame,
+- the top/bottom "black" borders filled with the **same video, zoomed in and blurred**,
+- a **small crop of the items/HUD** placed in the bottom border area.
+
+```
++---------------------------+      1080x1920 (9:16)
+|   blurred + zoomed bg     |      <- top border, no black bars
+|                           |
++---------------------------+
+|                           |
+|   ~1:1 gameplay crop      |      <- full source height, centered
+|   (middle of the screen)  |
+|                           |
++---------------------------+
+| [items]   blurred bg      |      <- items/HUD panel, bottom left
++---------------------------+
+```
+
+Layouts are driven by a **layout file** (`layout.json`): a list of named boxes, each with
+a *source* rectangle (what gets cropped from the video) and an *output* rectangle (where it
+is placed on the 9:16 canvas). Tune them **visually** with the built-in editor:
+
+```bash
+python make_shorts.py --config
+```
+
+Left: a paused video frame with the crop boxes. Right: a live preview of the
+composed output with the placement boxes. Drag boxes or their handles to move/resize,
+add/remove/rename boxes, adjust the background zoom/blur, and save — rendering picks the
+saved file up automatically.
+
+## Requirements
+
+- **Python 3.10+**
+- **ffmpeg** — either:
+  - installed and on your `PATH` (e.g. `winget install ffmpeg`), or
+  - the bundled binary from the `imageio-ffmpeg` package:
+
+    ```bash
+    python -m pip install imageio-ffmpeg
+    ```
+
+    The script picks whichever it finds (system ffmpeg first).
+- **Pillow** and **tkinter** — only for the `--config` editor UI
+  (`python -m pip install pillow`; tkinter ships with the standard Python installer).
+
+Rendering itself needs nothing but Python and ffmpeg.
+
+## Usage
+
+```bash
+python make_shorts.py --config               # open the layout editor (./layout.json)
+python make_shorts.py --config my.json       # open the editor on a specific layout file
+python make_shorts.py                        # every video in ./input
+python make_shorts.py clip.mp4               # one file
+python make_shorts.py folder1 folder2        # every video in the folders
+python make_shorts.py clip.mp4 -o out        # choose the output folder
+python make_shorts.py clip.mp4 --preview 30  # render ONE test frame at 30s (~1 second)
+python make_shorts.py clip.mp4 --layout my.json  # render with a specific layout file
+python make_shorts.py clip.mp4 --dry-run     # print the ffmpeg command, don't run it
+```
+
+Outputs land in `./output` (or `-o`) as `<name>_short.mp4`.
+
+## Folders
+
+The working folders are created automatically every time the script starts:
+
+| Folder | Purpose |
+|---|---|
+| `input/` | Drop the raw videos here (default input when no paths are given) |
+| `input/converted/` | Originals are moved here after their short renders successfully |
+| `output/` | Rendered shorts land here as `<name>_short.mp4` |
+| `output/published/` | Manually move shorts here once they have been uploaded |
+
+When rendering, the layout source is picked in this order: `--layout FILE`, then
+`./layout.json` if it exists, then the built-in `CONFIG` block. The command prints which
+one it used.
+
+**Tip:** `--preview <seconds>` writes a single PNG of the composed frame in about a second,
+so you can verify a layout on paper before encoding whole videos.
+
+## The layout editor (`--config`)
+
+| Where | What |
+|---|---|
+| **Left panel** | The video paused at the scrubber position. Each box outline is a region cropped **from** the source. |
+| **Right panel** | Live preview of the composed 9:16 output (recomposited instantly as you edit). Each box outline is where that crop is **placed** on the canvas. |
+| **Time bar** | Scrub to any frame (`‹ 1 frame` / `1 frame ›` steps by a single frame) to check the layout against different moments. |
+| **Boxes** | `Add`, `Remove`, `Rename`, `↑`/`↓` reorder (later in the list draws on top). |
+| **Selected box** | Exact `x y w h` fractions for the source crop and the output placement, plus `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`). |
+| **Background & output** | Blurred-background on/off, zoom, blur, output canvas size, CRF, x264 preset. |
+| **Render exact frame** | Renders the current frame through the **real** ffmpeg filter graph (~1 s) and shows it next to the command — the live preview approximates the blur, this is pixel-exact. |
+| **Save layout** | Writes the JSON. It is used automatically next time you render (or pass `--layout`). |
+
+Interactions: drag inside a box to move it, drag its corner/edge handles to resize,
+`Delete` removes the selected box, `Ctrl+S` saves. A fresh editor starts from the
+built-in `CONFIG` numbers, scaled to the first video you load.
+
+## layout.json reference
+
+```json
+{
+  "version": 1,
+  "output":    { "width": 1080, "height": 1920, "crf": 18, "preset": "medium" },
+  "background": { "enabled": true, "zoom": 1.4, "blur": 40.0 },
+  "boxes": [
+    {
+      "name": "main", "visible": true, "keep_aspect": true,
+      "src": { "x": 0.2572, "y": 0.0, "w": 0.4856, "h": 1.0 },
+      "out": { "x": 0.0,   "y": 0.2575, "w": 1.0, "h": 0.4849 }
+    }
+  ]
+}
+```
+
+- Every `x y w h` is a fraction (`0.0` – `1.0`) of the frame it refers to: `src` of the
+  source video, `out` of the output canvas.
+- `keep_aspect: true` scales the box to the output width and derives the height from the
+  crop's shape (the old `scale=W:-2` behavior). `false` stretches it to `w` × `h`.
+- Boxes are drawn in list order — later boxes render **on top** of earlier ones.
+- A source crop must stay inside the frame; an output placement may run past the canvas
+  edge (it gets clipped, which is how the items panel sits at the bottom).
+
+## CONFIG reference
+
+All `*_PCT` values are fractions (`0.0` – `1.0`) of the frame they refer to.
+All of these live in the `CONFIG` block at the top of `make_shorts.py`. They are used
+when no layout file exists yet, and they seed a brand-new layout in the editor.
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `OUTPUT_W`, `OUTPUT_H` | `1080`, `1920` | Output canvas (YouTube Shorts is 9:16) |
+| `CRF` | `18` | x264 quality — lower is better quality / bigger file |
+| `PRESET` | `medium` | x264 speed (`veryfast` … `veryslow`) |
+| `MAIN_ASPECT` | `1.0` | Crop width = source height × this (1.0 = perfect square) |
+| `MAIN_CENTER_X_PCT` | `0.5` | Where the crop sits **in the source**: 0 = left edge, 1 = right edge |
+| `MAIN_WIDTH_PCT` | `1.0` | Panel width on the output canvas (1.0 = full 1080 px) |
+| `MAIN_CENTER_Y_PCT` | `0.5` | Panel position on the output canvas: 0 = top, 1 = bottom |
+| `BG_ZOOM` | `1.4` | Background zoom (1.0 = plain cover fit, no extra zoom) |
+| `BG_BLUR` | `40.0` | Background blur strength (gblur sigma — bigger = smoother) |
+| `ITEMS_SRC_X_PCT` | `0.02` | Items crop top-left X **in the source** |
+| `ITEMS_SRC_Y_PCT` | `0.70` | Items crop top-left Y in the source (0.70 ≈ bottom-left area) |
+| `ITEMS_SRC_W_PCT` | `0.32` | Items crop width, as a fraction of source width |
+| `ITEMS_SRC_H_PCT` | `0.28` | Items crop height, as a fraction of source height |
+| `ITEMS_OUT_W_PCT` | `0.55` | Items panel display width on the output canvas (height keeps the crop's aspect) |
+| `ITEMS_OUT_X_PCT` | `0.02` | Items panel X on the output canvas |
+| `ITEMS_OUT_Y_PCT` | `0.80` | Items panel Y on the output canvas (0.80 = inside the bottom border) |
+| `INPUT_DIR` | `input` | Default input folder when no paths are given |
+| `CONVERTED_DIR` | `input/converted` | Originals are moved here after a successful render |
+| `OUTPUT_DIR` | `output` | Default output folder |
+| `PUBLISHED_DIR` | `output/published` | Drop zone for shorts that have already been uploaded |
+
+Example: zoom the background less and shrink the items panel:
+
+```python
+BG_ZOOM = 1.2
+ITEMS_OUT_W_PCT = 0.4
+```
+
+## Output format
+
+- H.264 (`libx264`), CRF 18, `yuv420p`, square pixels — safe for YouTube
+- AAC audio, 192 kbps (copied from the original, re-encoded)
+- `+faststart` so the file streams nicely when uploaded
+- The audio stream is optional — silent inputs work fine
+
+## Troubleshooting
+
+**`error: ffmpeg not found`**
+Install ffmpeg and put it on your `PATH`, or run `python -m pip install imageio-ffmpeg`.
+
+**The items panel is in the wrong place**
+Adjust `ITEMS_SRC_*` (where it is cropped *from* in your video) and `ITEMS_OUT_*`
+(where it is placed *on* the final video) separately — use `--preview` to check quickly.
+
+**Crop is off-center for my resolution**
+The crop is expressed relative to the source frame, so it works at any resolution.
+Nudge `MAIN_CENTER_X_PCT` (e.g. `0.45` or `0.55`) to move the window left or right.
+
+**Output looks stretched**
+`MAIN_ASPECT` sets the crop's width:height ratio (width = source height × `MAIN_ASPECT`).
+The panel keeps that ratio on the output canvas, so `1.0` is always a square.

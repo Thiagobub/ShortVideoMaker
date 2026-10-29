@@ -1,4 +1,4 @@
-# YTShortMaker
+# ShortVideoMaker
 
 Turns already-cropped Steam gameplay videos into **YouTube Shorts** (9:16) with one command:
 

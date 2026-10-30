@@ -22,6 +22,7 @@ rendering (or pass it explicitly with --layout FILE).
 
 from __future__ import annotations
 
+import copy
 import io
 import re
 import subprocess
@@ -40,6 +41,7 @@ import make_shorts as ms
 PREVIEW_H = 620        # height (px) of the right-hand preview canvas
 HANDLE = 7             # size of the resize handles
 MIN_SIZE = 0.005       # smallest box edge, as a fraction of the frame
+UNDO_LIMIT = 100       # how many layout states the undo history keeps
 BOX_COLORS = [
     "#ff5f5f", "#57e07a", "#57a7ff", "#ffd23f",
     "#d878ff", "#3fe0dd", "#ff9b3f", "#a6e84f",
@@ -111,6 +113,48 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+class ToolTip:
+    """Hover tooltip for a widget - explains what a button does."""
+
+    def __init__(self, widget: tk.Widget, text: str, delay: int = 500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after: str | None = None
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            self.widget.after_cancel(self._after)
+            self._after = None
+
+    def _show(self) -> None:
+        if self._tip is not None:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_attributes("-topmost", True)
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(tip, text=self.text, background="#ffffe0", foreground="#222",
+                 relief="solid", borderwidth=1, font=("", 9), padx=6, pady=3).pack()
+        self._tip = tip
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
 # ================================================================ UI
 class LayoutEditor:
     def __init__(self, root: tk.Tk, layout_path: Path, layout: dict, videos: list[Path],
@@ -121,6 +165,11 @@ class LayoutEditor:
         self.videos = videos
         self.fresh_default = fresh_default  # True until the user edits a brand-new layout
         self.dirty = False
+
+        self._snap: dict = copy.deepcopy(self.layout)  # last committed state
+        self._undo: list[dict] = []        # older committed states
+        self._redo: list[dict] = []        # states undone (empty = nothing to redo)
+        self._commit_job = None            # pending debounce timer for the history
 
         self.video: Path | None = None
         self.src_w = self.src_h = 0
@@ -140,6 +189,7 @@ class LayoutEditor:
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._update_title()
+        self._history_reset()
 
         if videos:
             self.load_video(videos[0])
@@ -168,6 +218,13 @@ class LayoutEditor:
         ttk.Button(top, text="Save layout", command=self.save).pack(side="left", padx=2)
         ttk.Button(top, text="Save as…", command=self.save_as).pack(side="left", padx=2)
         ttk.Button(top, text="Load…", command=self.load_from).pack(side="left", padx=2)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.btn_undo = ttk.Button(top, text="⟲ Undo", command=self.undo)
+        self.btn_undo.pack(side="left", padx=2)
+        ToolTip(self.btn_undo, "Undo the last change (Ctrl+Z)")
+        self.btn_redo = ttk.Button(top, text="⟳ Redo", command=self.redo)
+        self.btn_redo.pack(side="left", padx=2)
+        ToolTip(self.btn_redo, "Redo the last undone change (Ctrl+Y or Ctrl+Shift+Z)")
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(top, text="Render exact frame (ffmpeg)",
                    command=self.render_exact).pack(side="left", padx=2)
@@ -316,6 +373,27 @@ class LayoutEditor:
 
         self.root.bind("<Delete>", self._on_delete_key)
         self.root.bind("<Control-s>", lambda _e: self.save())
+        self.root.bind("<Control-z>", self._on_undo_key)
+        self.root.bind("<Control-y>", self._on_redo_key)
+        self.root.bind("<Control-Shift-Z>", self._on_redo_key)
+
+        self._sync_history_buttons()
+
+    def _on_undo_key(self, _event=None):
+        # don't undo while the user is typing in a text field (entries have
+        # their own editing behavior)
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Text, ttk.Entry)):
+            return
+        self.undo()
+        return "break"
+
+    def _on_redo_key(self, _event=None):
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, tk.Text, ttk.Entry)):
+            return
+        self.redo()
+        return "break"
 
     def _on_delete_key(self, _event=None) -> None:
         # don't delete a box while the user is typing in a text field
@@ -367,6 +445,7 @@ class LayoutEditor:
         if self.fresh_default and self.src_w:
             self.layout = ms.default_layout(self.src_w, self.src_h)
             self.fresh_default = False
+            self._history_reset()
         self.lbl_left_title.configure(
             text=f"SOURCE — crop boxes — {path.name} ({self.src_w}x{self.src_h} @ {self.fps:g} fps)")
         self._left_cache = None
@@ -483,6 +562,73 @@ class LayoutEditor:
         self.layout = ms.normalize_layout(self.layout)
         self.mark_dirty()
         self.refresh()
+
+    # ------------------------------------------------- undo / redo
+    def _history_reset(self) -> None:
+        """Forget the undo history and anchor it at the current layout."""
+        self._cancel_commit()
+        self._snap = copy.deepcopy(self.layout)
+        self._undo = []
+        self._redo = []
+        self._sync_history_buttons()
+
+    def _cancel_commit(self) -> None:
+        if self._commit_job is not None:
+            self.root.after_cancel(self._commit_job)
+            self._commit_job = None
+
+    def _schedule_commit(self) -> None:
+        """Record ONE undo step for a burst of changes (mouse drags, slider
+        scrubs, typing) - the step is committed once the changes settle."""
+        self._cancel_commit()
+        self._commit_job = self.root.after(400, self._commit)
+
+    def _commit(self) -> None:
+        self._commit_job = None
+        if self.layout == self._snap:
+            return
+        self._undo.append(self._snap)
+        del self._undo[:-UNDO_LIMIT]   # keep the history bounded
+        self._redo.clear()
+        self._snap = copy.deepcopy(self.layout)
+        self._sync_history_buttons()
+
+    def _apply_state(self, state: dict) -> None:
+        self.layout = ms.normalize_layout(copy.deepcopy(state))
+        self._snap = copy.deepcopy(self.layout)
+        self._bg_cache = None
+        self.selected = min(self.selected, len(self.layout["boxes"]) - 1)
+        self.mark_dirty()
+        self.refresh()
+        self._sync_history_buttons()
+
+    def undo(self) -> None:
+        self._cancel_commit()
+        if self.layout == self._snap and not self._undo:
+            self.status.configure(text="nothing to undo")
+            self._sync_history_buttons()
+            return
+        self._redo.append(copy.deepcopy(self.layout))
+        # an uncommitted change is undone back to the last committed state,
+        # otherwise pop the previous committed state
+        state = self._snap if self.layout != self._snap else self._undo.pop()
+        self._apply_state(state)
+        self.status.configure(text="undone - Ctrl+Y to redo")
+
+    def redo(self) -> None:
+        self._cancel_commit()
+        if not self._redo:
+            self.status.configure(text="nothing to redo")
+            self._sync_history_buttons()
+            return
+        self._undo.append(copy.deepcopy(self.layout))
+        self._apply_state(self._redo.pop())
+        self.status.configure(text="redone")
+
+    def _sync_history_buttons(self) -> None:
+        can_undo = bool(self._undo) or self.layout != self._snap
+        self.btn_undo.configure(state="normal" if can_undo else "disabled")
+        self.btn_redo.configure(state="normal" if self._redo else "disabled")
 
     # --------------------------------------------------- box actions
     def select(self, index: int) -> None:
@@ -666,6 +812,7 @@ class LayoutEditor:
     def _on_release(self, side: str, _event) -> None:
         if self.drag is not None:
             self.drag = None
+            self._commit()  # one drag = exactly one undo step
             self.refresh()
 
     # ------------------------------------------------------ drawing
@@ -825,6 +972,7 @@ class LayoutEditor:
     def mark_dirty(self) -> None:
         self.dirty = True
         self._update_title()
+        self._schedule_commit()  # every change becomes one undo step (debounced)
 
     def _update_title(self) -> None:
         star = "*" if self.dirty else ""
@@ -863,6 +1011,7 @@ class LayoutEditor:
         self.selected = -1
         self.dirty = False
         self._bg_cache = None
+        self._history_reset()
         self._update_title()
         self.refresh()
         self.status.configure(text=f"loaded {self.layout_path}")

@@ -92,13 +92,15 @@ so you can verify a layout on paper before encoding whole videos.
 | **Right panel** | Live preview of the composed 9:16 output (recomposited instantly as you edit). Each box outline is where that crop is **placed** on the canvas. |
 | **Time bar** | Scrub to any frame (`‹ 1 frame` / `1 frame ›` steps by a single frame) to check the layout against different moments. |
 | **Boxes** | `Add`, `Remove`, `Rename`, `↑`/`↓` reorder (later in the list draws on top). |
+| **Undo / Redo** | Step backwards/forwards through every change. Buttons in the top bar (hover them for a hint) or `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z` also works). One drag or one slider scrub = one step. |
 | **Selected box** | Exact `x y w h` fractions for the source crop and the output placement, plus `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`). |
 | **Background & output** | Blurred-background on/off, zoom, blur, output canvas size, CRF, x264 preset. |
 | **Render exact frame** | Renders the current frame through the **real** ffmpeg filter graph (~1 s) and shows it next to the command — the live preview approximates the blur, this is pixel-exact. |
 | **Save layout** | Writes the JSON. It is used automatically next time you render (or pass `--layout`). |
 
 Interactions: drag inside a box to move it, drag its corner/edge handles to resize,
-`Delete` removes the selected box, `Ctrl+S` saves. A fresh editor starts from the
+`Delete` removes the selected box, `Ctrl+S` saves, `Ctrl+Z` undoes the last change,
+`Ctrl+Y` (or `Ctrl+Shift+Z`) redoes it. A fresh editor starts from the
 built-in `CONFIG` numbers, scaled to the first video you load.
 
 ## layout.json reference

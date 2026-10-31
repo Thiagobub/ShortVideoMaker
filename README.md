@@ -62,9 +62,37 @@ python make_shorts.py clip.mp4 -o out        # choose the output folder
 python make_shorts.py clip.mp4 --preview 30  # render ONE test frame at 30s (~1 second)
 python make_shorts.py clip.mp4 --layout my.json  # render with a specific layout file
 python make_shorts.py clip.mp4 --dry-run     # print the ffmpeg command, don't run it
+python make_shorts.py --encoder nvidia       # force an encoder: auto | nvidia | amd | intel | cpu
 ```
 
+### GPU acceleration
+
+By default (`--encoder auto`) rendering uses the first GPU encoder that works on this
+machine — **NVIDIA** (`h264_nvenc`), then **AMD** (`h264_amf`), then **Intel**
+(`h264_qsv`) — and falls back to the **CPU** (`libx264`) when none does. Each one is
+checked with a tiny test encode at startup, since being compiled into ffmpeg doesn't
+mean the hardware is present. If a GPU render fails anyway, that video is retried on the
+CPU automatically. `CRF` / `PRESET` are mapped to each encoder's closest equivalent.
+The filters (crop, scale, blur) still run on the CPU, so the speedup depends on the
+layout.
+
 Outputs land in `./output` (or `-o`) as `<name>_short.mp4`.
+
+### Control panel (GUI)
+
+```bash
+python gui.py      # or: pythonw gui.py (no console window on Windows)
+```
+
+A small window over the same pipeline: lists the videos in `./input` (add more with
+*Adicionar…*), picks a layout file, renders with per-video and overall progress, can
+cancel (the half-written output is deleted), renders a single test frame (*Prévia*),
+opens the layout editor and the output folder. The *Título* / *Crédito* columns hold each
+video's `{title}` and `{credit}` (double-click a row to edit them; saved to
+`input/titles.json`). The *Aceleração* dropdown shows the
+encoders detected on this machine (`Auto → …` names the one it picked) and lets you
+choose another; GPU failures fall back to the CPU the same way. With no rows selected, *Renderizar*
+processes every row that isn't done yet; with a selection, only those.
 
 ## Folders
 
@@ -96,6 +124,7 @@ so you can verify a layout on paper before encoding whole videos.
 | **Selected box** | Exact `x y w h` fractions for the source crop and the output placement, plus `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`). |
 | **Background & output** | Blurred-background on/off, zoom, blur, output canvas size, CRF, x264 preset. |
 | **Render exact frame** | Renders the current frame through the **real** ffmpeg filter graph (~1 s) and shows it next to the command — the live preview approximates the blur, this is pixel-exact. |
+| **Texts & images** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image` add more; drag their dashed rectangles on the preview. Pick any installed Windows font (or a `.ttf` with `…` / in `./fonts`), size, text color, box color, outline and alignment. `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
 | **Save layout** | Writes the JSON. It is used automatically next time you render (or pass `--layout`). |
 
 Interactions: drag inside a box to move it, drag its corner/edge handles to resize,
@@ -127,6 +156,31 @@ built-in `CONFIG` numbers, scaled to the first video you load.
 - Boxes are drawn in list order — later boxes render **on top** of earlier ones.
 - A source crop must stay inside the frame; an output placement may run past the canvas
   edge (it gets clipped, which is how the items panel sits at the bottom).
+- `overlays` (drawn only when `overlays_enabled` is true) are texts and images on top of
+  everything, each with an `out` rectangle:
+
+  ```json
+  "overlays_enabled": true,
+  "overlays": [
+    { "type": "text", "visible": true, "text": "CREDIT: {credit}", "font": "impact.ttf",
+      "size": 0.03, "color": "#000000", "bg_enabled": true, "bg": "#FFFFFF",
+      "outline": false, "align": "center",
+      "out": { "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.06 } },
+    { "type": "image", "visible": true, "path": "logo.png",
+      "out": { "x": 0.6, "y": 0.82, "w": 0.35, "h": 0.1 } }
+  ]
+  ```
+
+  A text wraps to its rectangle's width and shrinks (from `size`, a fraction of the output
+  height) until it fits; `{title}` / `{credit}` come from `input/titles.json`, and a text
+  whose variable is empty for a video is skipped. An image is fitted inside its rectangle.
+  Texts and still images are drawn with Pillow into transparent PNGs laid over the video,
+  so rendering a layout with overlays needs Pillow too.
+- An `image` whose `path` is a **GIF or a video** is animated: ffmpeg loops it
+  (`-stream_loop -1`) for the whole short, fitted inside its rectangle, and the short
+  still ends with the gameplay. Its own audio is ignored. GIF transparency is kept. The
+  editor preview shows its first frame; *Render exact frame* shows the real thing.
+  Overlays stack in list order, so a text after a GIF/video is drawn on top of it.
 
 ## CONFIG reference
 

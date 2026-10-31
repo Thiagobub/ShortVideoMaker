@@ -38,10 +38,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # ============================== CONFIG =================================
@@ -79,6 +83,20 @@ OUTPUT_DIR = "output"              # default output folder
 PUBLISHED_DIR = "output/published"  # move finished shorts here after uploading them
 
 DEFAULT_LAYOUT_NAME = "layout.json"  # written by --config, read when rendering
+
+# ---- ENCODERS: GPU acceleration, with the CPU (x264) as the fallback ---
+ENCODERS = {  # key -> label shown to the user
+    "nvidia": "NVIDIA (NVENC)",
+    "amd": "AMD (AMF)",
+    "intel": "Intel (QSV)",
+    "cpu": "CPU (x264)",
+}
+GPU_ORDER = ("nvidia", "amd", "intel")  # "auto" picks the first one that works
+
+# ---- OVERLAYS: texts/images drawn on top of the short ----------------
+TITLES_FILE = "input/titles.json"  # per-video {title}/{credit} values, typed in gui.py
+FONTS_DIR = "fonts"                # optional extra .ttf/.otf files for the overlays
+DEFAULT_FONT = "impact.ttf"        # ships with Windows
 # ======================================================================
 
 VIDEO_EXTS = {
@@ -246,7 +264,345 @@ def normalize_layout(raw: dict) -> dict:
             "out": rect("out", must_fit=False),
         })
 
-    return {"version": 1, "output": output, "background": background, "boxes": boxes}
+    overlays = [normalize_overlay(ov, i) for i, ov in enumerate(raw.get("overlays") or [])]
+
+    return {
+        "version": 1, "output": output, "background": background, "boxes": boxes,
+        "overlays_enabled": bool(raw.get("overlays_enabled", bool(overlays))),
+        "overlays": overlays,
+    }
+
+
+# ============================== OVERLAYS ==============================
+# Texts and images drawn on top of the composed short. Each overlay has an
+# "out" rectangle (fractions of the output canvas) like a box. A text is
+# wrapped to the rectangle's width and shrunk until it fits its height, so
+# titles of any length stay inside it. "{title}" and "{credit}" in a text
+# are replaced per video (TITLES_FILE); an overlay whose variable is empty
+# is skipped. Texts and still images are drawn with Pillow into transparent
+# PNGs, which ffmpeg lays over the video - the editor preview uses the same
+# code. GIFs and videos ("media") are extra ffmpeg inputs looped forever and
+# fitted into their rectangle; the short still ends with the gameplay.
+
+FONT_EXTS = {".ttf", ".otf", ".ttc"}
+ANIMATED_EXTS = {".gif"} | VIDEO_EXTS
+HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def normalize_overlay(raw: dict, i: int) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError(f"layout: overlay #{i + 1} must be a JSON object")
+    kind = raw.get("type", "text")
+    if kind not in ("text", "image"):
+        raise ValueError(f"layout: overlay #{i + 1} has unknown type '{kind}'")
+    r = raw.get("out") or {}
+    w = max(clamp01(r.get("w", 0.5)), 0.005)
+    h = max(clamp01(r.get("h", 0.1)), 0.005)
+    ov = {
+        "type": kind,
+        "visible": bool(raw.get("visible", True)),
+        "out": {"x": clamp01(r.get("x", 0)), "y": clamp01(r.get("y", 0)), "w": w, "h": h},
+    }
+    if kind == "image":
+        ov["path"] = str(raw.get("path", ""))
+        return ov
+
+    def color(key: str, default: str) -> str:
+        value = str(raw.get(key, default))
+        return value if HEX_COLOR_RE.fullmatch(value) else default
+
+    ov.update({
+        "text": str(raw.get("text", "")),
+        "font": str(raw.get("font") or DEFAULT_FONT),
+        "size": max(0.005, min(0.5, float(raw.get("size", 0.045)))),  # fraction of output height
+        "color": color("color", "#FFFFFF"),
+        "bg_enabled": bool(raw.get("bg_enabled", True)),
+        "bg": color("bg", "#000000"),
+        "outline": bool(raw.get("outline", False)),
+        "align": raw.get("align") if raw.get("align") in ("left", "center", "right") else "center",
+    })
+    return ov
+
+
+def example_overlays() -> list[dict]:
+    """A credit line + a title above the gameplay (the default CONFIG leaves ~25% free on top)."""
+    return [
+        normalize_overlay({"type": "text", "text": "CREDIT: {credit}", "size": 0.03,
+                           "color": "#000000", "bg": "#FFFFFF",
+                           "out": {"x": 0.05, "y": 0.05, "w": 0.9, "h": 0.06}}, 0),
+        normalize_overlay({"type": "text", "text": "{title}", "size": 0.05,
+                           "color": "#FFFFFF", "bg": "#000000",
+                           "out": {"x": 0.05, "y": 0.12, "w": 0.9, "h": 0.12}}, 1),
+    ]
+
+
+def font_dirs() -> list[Path]:
+    dirs = [Path(FONTS_DIR)]
+    if sys.platform == "win32":
+        dirs.append(Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts")
+        if os.environ.get("LOCALAPPDATA"):
+            dirs.append(Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "Fonts")
+    else:
+        dirs += [Path.home() / ".fonts", Path("/usr/share/fonts"), Path("/Library/Fonts")]
+    return dirs
+
+
+def resolve_font(name: str) -> Path | None:
+    """A layout's font (file name, or a full path) -> the file on this machine."""
+    path = Path(name)
+    if path.is_absolute() or path.parent != Path("."):
+        return path if path.exists() else None  # a full or project-relative path
+    for d in font_dirs():
+        if (d / name).exists():
+            return d / name
+    return None
+
+
+def system_fonts() -> dict[str, str]:
+    """Display name -> font file name, for the installed fonts plus ./fonts."""
+    fonts: dict[str, str] = {}
+    if sys.platform == "win32":
+        import winreg
+
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+            except OSError:
+                continue
+            with key:
+                for i in range(winreg.QueryInfoKey(key)[1]):
+                    name, file, _ = winreg.EnumValue(key, i)
+                    if isinstance(file, str) and Path(file).suffix.lower() in FONT_EXTS:
+                        fonts[re.sub(r"\s*\((TrueType|OpenType)\)$", "", name)] = Path(file).name
+    for d in font_dirs():
+        if d.is_dir() and (d == Path(FONTS_DIR) or sys.platform != "win32"):
+            for f in d.rglob("*"):
+                if f.suffix.lower() in FONT_EXTS:
+                    fonts.setdefault(f.stem, f.name)
+    return dict(sorted(fonts.items(), key=lambda kv: kv[0].lower()))
+
+
+@functools.lru_cache(maxsize=64)
+def load_font(name: str, size: int):
+    from PIL import ImageFont
+
+    path = resolve_font(name)
+    if path:
+        try:
+            return ImageFont.truetype(str(path), size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size)
+
+
+def fill_text(template: str, values: dict) -> str | None:
+    """Replace {title}/{credit}; None when a variable used is empty (the overlay is skipped)."""
+    missing = False
+
+    def sub(m: re.Match) -> str:
+        nonlocal missing
+        value = str(values.get(m[1], "")).strip()
+        missing = missing or not value
+        return value
+
+    text = re.sub(r"\{(\w+)\}", sub, template)
+    return None if missing or not text.strip() else text
+
+
+def _wrap(draw, text: str, font, width: float) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        line = ""
+        for word in paragraph.split():
+            test = f"{line} {word}".strip()
+            if line and draw.textlength(test, font=font) > width:
+                lines.append(line)
+                line = word
+            else:
+                line = test
+        lines.append(line)
+    return lines
+
+
+def _draw_text(canvas, ov: dict, values: dict) -> None:
+    from PIL import Image, ImageDraw
+
+    text = fill_text(ov["text"], values)
+    if text is None:
+        return
+    cw, ch = canvas.size
+    r = ov["out"]
+    bx, by, bw, bh = r["x"] * cw, r["y"] * ch, r["w"] * cw, r["h"] * ch
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+
+    # largest size <= the requested one whose wrapped text fits the rectangle
+    size = max(4, round(ov["size"] * ch))
+    while True:
+        font = load_font(ov["font"], size)
+        pad = round(size * 0.3) if ov["bg_enabled"] else 0
+        stroke = max(1, round(size * 0.08)) if ov["outline"] else 0
+        lines = _wrap(draw, text, font, bw - 2 * pad)
+        ascent, descent = font.getmetrics()
+        line_h = ascent + descent
+        widths = [draw.textlength(line, font=font) + 2 * stroke for line in lines]
+        block_w = max(widths) + 2 * pad
+        block_h = line_h * len(lines) + 2 * pad
+        if (block_w <= bw and block_h <= bh) or size <= 4:
+            break
+        size = max(4, int(size * 0.92))
+
+    if ov["align"] == "left":
+        x0 = bx
+    elif ov["align"] == "right":
+        x0 = bx + bw - block_w
+    else:
+        x0 = bx + (bw - block_w) / 2
+    y0 = by + (bh - block_h) / 2
+    if ov["bg_enabled"]:
+        draw.rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=ov["bg"])
+    inner_w = block_w - 2 * pad
+    for i, (line, lw) in enumerate(zip(lines, widths)):
+        if ov["align"] == "left":
+            lx = x0 + pad
+        elif ov["align"] == "right":
+            lx = x0 + pad + inner_w - lw
+        else:
+            lx = x0 + pad + (inner_w - lw) / 2
+        draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=ov["color"],
+                  stroke_width=stroke, stroke_fill="#000000")
+    canvas.alpha_composite(layer)
+
+
+def is_media(ov: dict) -> bool:
+    """A GIF or a video: looped by ffmpeg instead of drawn as a still."""
+    return ov["type"] == "image" and Path(ov["path"]).suffix.lower() in ANIMATED_EXTS
+
+
+@functools.lru_cache(maxsize=16)
+def _media_still(path: str, mtime: float):
+    """First frame of a video (for previews), via ffmpeg."""
+    import io
+
+    from PIL import Image
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return None
+    res = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", path, "-frames:v", "1",
+         "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+        capture_output=True, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
+    )
+    if res.returncode != 0 or not res.stdout:
+        return None
+    return Image.open(io.BytesIO(res.stdout)).convert("RGBA")
+
+
+def _draw_image(canvas, ov: dict) -> None:
+    from PIL import Image
+
+    path = Path(ov["path"])
+    try:
+        if path.suffix.lower() in VIDEO_EXTS:
+            img = _media_still(str(path), path.stat().st_mtime)
+            if img is None:
+                return
+        else:
+            img = Image.open(path).convert("RGBA")  # a GIF shows its first frame
+    except (OSError, ValueError):
+        return
+    cw, ch = canvas.size
+    r = ov["out"]
+    bw, bh = r["w"] * cw, r["h"] * ch
+    scale = min(bw / img.width, bh / img.height)  # fit inside the rectangle, keep aspect
+    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+    img = img.resize(size, Image.LANCZOS)
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    layer.paste(img, (round(r["x"] * cw + (bw - size[0]) / 2), round(r["y"] * ch + (bh - size[1]) / 2)))
+    canvas.alpha_composite(layer)
+
+
+def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None):
+    """Overlays on a transparent RGBA image of `size`, or None. By default all the
+    layout's visible ones (GIFs/videos as their first frame, for previews)."""
+    if items is None:
+        if not layout.get("overlays_enabled"):
+            return None
+        items = [ov for ov in layout.get("overlays", []) if ov["visible"]]
+    if not items:
+        return None
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("texts/images need Pillow: python -m pip install pillow") from exc
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    for ov in items:
+        if ov["type"] == "text":
+            _draw_text(canvas, ov, values)
+        else:
+            _draw_image(canvas, ov)
+    return canvas
+
+
+def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, list[str]]:
+    """Split one video's overlays into ffmpeg layers, keeping their stacking order.
+
+    Returns (layers, input args): one layer per extra input (1, 2, ...) - None for a
+    full-canvas PNG of consecutive texts/stills, or the GIF/video overlay dict."""
+    if not layout.get("overlays_enabled"):
+        return [], []
+    out = layout["output"]
+    size = (even(out["width"]), even(out["height"]))
+    layers: list = []
+    inputs: list[str] = []
+    run: list[dict] = []  # consecutive stills, drawn into one PNG
+
+    def flush() -> None:
+        img = render_overlays(layout, values, size, run) if run else None
+        if img is not None and img.getbbox() is not None:
+            png = tmp_prefix.with_name(f"{tmp_prefix.name}_{len(layers)}.png")
+            img.save(png)
+            layers.append(None)
+            inputs.extend(["-i", str(png)])
+        run.clear()
+
+    for ov in layout["overlays"]:
+        if not ov["visible"]:
+            continue
+        if is_media(ov):
+            if Path(ov["path"]).is_file():
+                flush()
+                layers.append(ov)
+                inputs.extend(["-stream_loop", "-1", "-i", ov["path"]])
+        else:
+            run.append(ov)
+    flush()
+    return layers, inputs
+
+
+def filter_for_video(layout: dict | None, values: dict, tmp_prefix: Path) -> tuple[str, list[str]]:
+    """Filter graph for one video (built-in CONFIG when layout is None) + the extra
+    ffmpeg input args its overlays need (PNG files are written next to tmp_prefix)."""
+    if layout is None:
+        return build_filter_complex(), []
+    layers, inputs = overlay_layers(layout, values, tmp_prefix)
+    return build_filter_complex_from_layout(layout, layers), inputs
+
+
+def load_titles() -> dict[str, dict]:
+    """Video file name -> {"title": ..., "credit": ...}."""
+    try:
+        data = json.loads(Path(TITLES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_titles(titles: dict[str, dict]) -> None:
+    Path(TITLES_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(TITLES_FILE).write_text(json.dumps(titles, indent=2, ensure_ascii=False) + "\n",
+                                 encoding="utf-8")
 
 
 def load_layout(path: Path) -> dict:
@@ -261,8 +617,9 @@ def save_layout(path: Path, layout: dict) -> None:
     path.write_text(json.dumps(normalize_layout(layout), indent=2) + "\n", encoding="utf-8")
 
 
-def build_filter_complex_from_layout(layout: dict) -> str:
-    """Build the ffmpeg filter graph from a layout dict (see default_layout)."""
+def build_filter_complex_from_layout(layout: dict, layers: list | None = None) -> str:
+    """Build the ffmpeg filter graph from a layout dict (see default_layout).
+    `layers` describes extra inputs 1, 2, ... laid on top in order (see overlay_layers)."""
     out = layout["output"]
     width, height = even(out["width"]), even(out["height"])
     boxes = [b for b in layout["boxes"] if b.get("visible", True)]
@@ -309,30 +666,98 @@ def build_filter_complex_from_layout(layout: dict) -> str:
         x, y = even(width * dst["x"]), even(height * dst["y"])
         parts.append(f"[{prev}][b{i}]overlay=x={x}:y={y}[{label}]")
         prev = label
+
+    # texts/images (a full-canvas PNG) and looped GIFs/videos (fitted in their rect)
+    for k, ov in enumerate(layers or [], start=1):
+        if ov is None:
+            parts.append(f"[{prev}][{k}:v]overlay=x=0:y=0[l{k}]")
+        else:
+            r = ov["out"]
+            bw, bh = even(width * r["w"]), even(height * r["h"])
+            x, y = round(width * r["x"]), round(height * r["y"])
+            parts.append(f"[{k}:v]scale=w={bw}:h={bh}:force_original_aspect_ratio=decrease,"
+                         f"setsar=1[m{k}]")
+            # shortest=1: the endlessly looped input stops when the gameplay does
+            parts.append(f"[{prev}][m{k}]overlay=x={x}+({bw}-overlay_w)/2"
+                         f":y={y}+({bh}-overlay_h)/2:shortest=1[l{k}]")
+        prev = f"l{k}"
     parts.append(f"[{prev}]setsar=1[vout]")
     return ";".join(parts)
 # ======================================================================
 
 
-def build_render_cmd(ffmpeg: str, src: Path, dst: Path, fc: str) -> list[str]:
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+# x264 preset name -> NVENC preset (p1 = fastest ... p7 = best quality)
+_NVENC_PRESETS = {
+    "ultrafast": "p1", "superfast": "p1", "veryfast": "p2", "faster": "p3",
+    "fast": "p4", "medium": "p5", "slow": "p6", "slower": "p7", "veryslow": "p7",
+}
+
+
+def encoder_args(encoder: str, crf: int = CRF, preset: str = PRESET) -> list[str]:
+    """Video codec options for an ENCODERS key, mapping CRF/preset to its closest equivalent."""
+    if encoder == "nvidia":
+        return ["-c:v", "h264_nvenc", "-preset", _NVENC_PRESETS.get(preset, "p5"),
+                "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if encoder == "amd":
+        quality = ("speed" if preset in ("ultrafast", "superfast", "veryfast", "faster")
+                   else "quality" if preset in ("slow", "slower", "veryslow") else "balanced")
+        return ["-c:v", "h264_amf", "-quality", quality, "-rc", "cqp",
+                "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf), "-pix_fmt", "yuv420p"]
+    if encoder == "intel":
+        qsv_preset = preset if preset not in ("ultrafast", "superfast") else "veryfast"
+        return ["-c:v", "h264_qsv", "-preset", qsv_preset, "-global_quality", str(crf),
+                "-pix_fmt", "nv12"]
+    return ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+
+def encoder_works(ffmpeg: str, encoder: str) -> bool:
+    """Encode a few black frames: being compiled into ffmpeg doesn't mean the GPU is there."""
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=black:size=640x360:rate=30",
+        "-frames:v", "5", *encoder_args(encoder), "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=20, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def detect_encoders(ffmpeg: str) -> list[str]:
+    """Working GPU encoders (in GPU_ORDER), always followed by "cpu"."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(len(GPU_ORDER)) as pool:
+        works = list(pool.map(lambda e: encoder_works(ffmpeg, e), GPU_ORDER))
+    return [e for e, ok in zip(GPU_ORDER, works) if ok] + ["cpu"]
+
+
+def build_render_cmd(ffmpeg: str, src: Path, dst: Path, fc: str, encoder: str = "cpu",
+                     extra_inputs: list[str] | None = None) -> list[str]:
     return [
         ffmpeg, "-y", "-hide_banner",
         "-i", str(src),
+        *(extra_inputs or []),
         "-filter_complex", fc,
         "-map", "[vout]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF),
-        "-pix_fmt", "yuv420p",
+        *encoder_args(encoder),
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         str(dst),
     ]
 
 
-def build_preview_cmd(ffmpeg: str, src: Path, dst: Path, fc: str, at: float) -> list[str]:
+def build_preview_cmd(ffmpeg: str, src: Path, dst: Path, fc: str, at: float,
+                      extra_inputs: list[str] | None = None) -> list[str]:
     return [
         ffmpeg, "-y", "-hide_banner",
         "-ss", f"{at:g}",
         "-i", str(src),
+        *(extra_inputs or []),
         "-filter_complex", fc,
         "-map", "[vout]",
         "-frames:v", "1",
@@ -413,6 +838,11 @@ def main() -> None:
              f"(default: ./{DEFAULT_LAYOUT_NAME} if it exists, else the built-in CONFIG)",
     )
     parser.add_argument(
+        "--encoder", choices=["auto", *ENCODERS], default="auto",
+        help="video encoder: auto = first working GPU (nvidia, amd, intel), else cpu; "
+             "a failed GPU render is retried on the cpu",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="print the ffmpeg command without running it",
     )
@@ -457,6 +887,7 @@ def main() -> None:
     layout_file = Path(args.layout) if args.layout else Path(DEFAULT_LAYOUT_NAME)
     if args.layout and not layout_file.exists():
         sys.exit(f"error: layout file not found: {layout_file}")
+    layout: dict | None = None
     if layout_file.exists():
         try:
             layout = load_layout(layout_file)
@@ -465,23 +896,40 @@ def main() -> None:
         fc = build_filter_complex_from_layout(layout)
         boxes = len([b for b in layout["boxes"] if b.get("visible", True)])
         source = f"{layout_file} ({layout['output']['width']}x{layout['output']['height']}, {boxes} box(es))"
+        if layout["overlays_enabled"]:
+            source += f", {len(layout['overlays'])} text/image overlay(s)"
     else:
         fc = build_filter_complex()
         source = "built-in CONFIG"
+    titles = load_titles()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="shorts_overlay_"))
+
+    # pick the encoder: only GPUs that pass a quick test encode, else the cpu
+    available = detect_encoders(ffmpeg) if ffmpeg and args.preview is None else ["cpu"]
+    encoder = available[0] if args.encoder == "auto" else args.encoder
+    if encoder not in available:
+        print(f"warning: {ENCODERS[encoder]} is not available here, using {ENCODERS['cpu']}")
+        encoder = "cpu"
 
     print(f"ffmpeg:   {ffmpeg or '(not found)'}")
+    print(f"encoder:  {ENCODERS[encoder]}")
     print(f"layout:   {source}")
     print(f"inputs:   {len(files)} video(s)")
     print(f"filter:   {fc}\n")
 
     failures = 0
-    for src in files:
+    for n, src in enumerate(files):
+        # {title}/{credit} differ per video, so the overlays are drawn per video
+        try:
+            fc, extra = filter_for_video(layout, titles.get(src.name, {}), tmp_dir / str(n))
+        except RuntimeError as exc:
+            sys.exit(f"error: {exc}")
         if args.preview is not None:
             dst = out_dir / f"{src.stem}_preview_{args.preview:g}s.png"
-            cmd = build_preview_cmd(ffmpeg, src, dst, fc, args.preview)
+            cmd = build_preview_cmd(ffmpeg, src, dst, fc, args.preview, extra)
         else:
             dst = out_dir / f"{src.stem}_short.mp4"
-            cmd = build_render_cmd(ffmpeg, src, dst, fc)
+            cmd = build_render_cmd(ffmpeg, src, dst, fc, encoder, extra)
 
         if args.dry_run:
             print(" ".join(f'"{c}"' if " " in c else c for c in cmd))
@@ -489,6 +937,9 @@ def main() -> None:
 
         print(f"[render] {src.name} -> {dst}")
         result = subprocess.run(cmd)
+        if result.returncode != 0 and args.preview is None and encoder != "cpu":
+            print(f"[fallback] {ENCODERS[encoder]} failed on {src.name}, retrying on {ENCODERS['cpu']}")
+            result = subprocess.run(build_render_cmd(ffmpeg, src, dst, fc, "cpu", extra))
         if result.returncode != 0:
             failures += 1
             print(f"[FAILED] {src.name} (ffmpeg exit code {result.returncode})")
@@ -497,6 +948,7 @@ def main() -> None:
             if moved != src:
                 print(f"[moved]  {src.name} -> {moved}")
 
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     if args.dry_run:
         return
     if failures:

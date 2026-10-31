@@ -31,7 +31,7 @@ import tempfile
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageFilter, ImageTk
 
@@ -45,6 +45,12 @@ UNDO_LIMIT = 100       # how many layout states the undo history keeps
 BOX_COLORS = [
     "#ff5f5f", "#57e07a", "#57a7ff", "#ffd23f",
     "#d878ff", "#3fe0dd", "#ff9b3f", "#a6e84f",
+]
+OVERLAY_COLOR = "#ffffff"  # outline of the text/image rectangles (dashed)
+IMAGE_TYPES = [
+    ("Images, GIFs and videos", "*.png *.jpg *.jpeg *.webp *.bmp *.gif "
+     + " ".join(f"*{e}" for e in sorted(ms.VIDEO_EXTS))),
+    ("All files", "*.*"),
 ]
 
 FPS_RE = re.compile(r"([\d.]+)\s*fps")
@@ -113,6 +119,21 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def set_if_changed(var: tk.Variable, value) -> None:
+    """Update a field without moving the cursor of an entry the user is typing in."""
+    if var.get() != value:
+        var.set(value)
+
+
+def project_path(path: str) -> str:
+    """Store files inside the project as relative paths (the layout stays portable)."""
+    p = Path(path).resolve()
+    try:
+        return p.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return str(p)
+
+
 class ToolTip:
     """Hover tooltip for a widget - explains what a button does."""
 
@@ -179,6 +200,12 @@ class LayoutEditor:
         self.frame: Image.Image | None = None
 
         self.selected = -1
+        self.ov_selected = -1                    # selected text/image (-1 = a box or nothing)
+        self.fonts = ms.system_fonts()           # display name -> font file
+        self.font_names = {}                     # font file -> display name
+        for name, file in self.fonts.items():
+            self.font_names.setdefault(file.lower(), name)
+        self._ov_kind_shown: str | None = None   # which field set is on screen
         self.drag: dict | None = None
         self.left_map = (0, 0, 0, 0)     # (x0, y0, w, h) of the frame on the canvas
         self.right_map = (0, 0, 0, 0)
@@ -199,7 +226,7 @@ class LayoutEditor:
     # ------------------------------------------------------------ UI
     def _build_ui(self) -> None:
         self.root.title("Layout editor")
-        self.root.geometry("1520x1000")
+        self.root.geometry("1600x1000")
         self.root.minsize(1100, 720)
 
         # ---- top bar: video + files -------------------------------
@@ -282,6 +309,7 @@ class LayoutEditor:
         bottom.columnconfigure(0, weight=1)
         bottom.columnconfigure(1, weight=2)
         bottom.columnconfigure(2, weight=2)
+        bottom.columnconfigure(3, weight=2)
 
         # boxes list
         grp_boxes = ttk.LabelFrame(bottom, text="Boxes (top of list = bottom of the stack)")
@@ -368,8 +396,10 @@ class LayoutEditor:
         cb.pack(side="left", padx=2)
         cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_fields())
 
+        self._build_overlay_ui(bottom)
+
         self.status = ttk.Label(bottom, text="", foreground="#666")
-        self.status.grid(row=1, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 0))
+        self.status.grid(row=1, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 0))
 
         self.root.bind("<Delete>", self._on_delete_key)
         self.root.bind("<Control-s>", lambda _e: self.save())
@@ -400,7 +430,108 @@ class LayoutEditor:
         focused = self.root.focus_get()
         if isinstance(focused, (tk.Entry, tk.Text, ttk.Entry)):
             return
-        self.remove_box()
+        if self.current_overlay() is not None:
+            self.remove_overlay()
+        else:
+            self.remove_box()
+
+    def _build_overlay_ui(self, parent: ttk.Frame) -> None:
+        grp = ttk.LabelFrame(parent, text="Texts & images (drawn on top of everything)")
+        grp.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
+        grp.columnconfigure(0, weight=1)
+        self.var_ov_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(grp, text="this layout has texts / images", variable=self.var_ov_on,
+                        command=self._on_overlays_toggle).grid(row=0, column=0, sticky="w",
+                                                               padx=6, pady=(6, 0))
+        self.ov_listbox = tk.Listbox(grp, height=3, exportselection=False)
+        self.ov_listbox.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 2))
+        self.ov_listbox.bind("<<ListboxSelect>>", self._on_ov_list_select)
+        row = ttk.Frame(grp)
+        row.grid(row=2, column=0, sticky="w", padx=6)
+        for text, cmd, width in (("+ Text", self.add_text, 7), ("+ Image/GIF", self.add_image, 10),
+                                 ("Remove", self.remove_overlay, 7),
+                                 ("↑", lambda: self.move_overlay(-1), 3),
+                                 ("↓", lambda: self.move_overlay(1), 3),
+                                 ("⇔ center", self.center_overlay, 8)):
+            ttk.Button(row, text=text, width=width, command=cmd).pack(side="left", padx=1)
+        ToolTip(row.winfo_children()[1], "PNG/JPG, or a GIF / video that loops for the whole short "
+                                         "(the preview shows its first frame)")
+
+        # fields of the selected text (shown when a text is selected)
+        f = self.ov_text_frame = ttk.Frame(grp)
+        f.columnconfigure(1, weight=1)
+        self.var_ov_visible = tk.BooleanVar(value=True)
+        self.var_ov_text = tk.StringVar()
+        self.var_ov_font = tk.StringVar()
+        self.var_ov_size = tk.StringVar()
+        self.var_ov_align = tk.StringVar(value="center")
+        self.var_ov_bg_on = tk.BooleanVar(value=True)
+        self.var_ov_outline = tk.BooleanVar(value=False)
+
+        ttk.Label(f, text="text").grid(row=0, column=0, sticky="w")
+        e = ttk.Entry(f, textvariable=self.var_ov_text)
+        e.grid(row=0, column=1, columnspan=2, sticky="ew", pady=1)
+        e.bind("<KeyRelease>", self._on_ov_field)
+        ToolTip(e, "{title} and {credit} are replaced by each video's values (typed in gui.py)")
+        ttk.Label(f, text="font").grid(row=1, column=0, sticky="w")
+        cb = ttk.Combobox(f, textvariable=self.var_ov_font, state="readonly", values=list(self.fonts))
+        cb.grid(row=1, column=1, sticky="ew", pady=1)
+        cb.bind("<<ComboboxSelected>>", self._on_ov_field)
+        btn = ttk.Button(f, text="…", width=3, command=self.pick_font_file)
+        btn.grid(row=1, column=2, padx=(2, 0))
+        ToolTip(btn, "Use a .ttf/.otf file that isn't installed (or drop it in ./fonts)")
+
+        style = ttk.Frame(f)
+        style.grid(row=2, column=0, columnspan=3, sticky="w", pady=1)
+        ttk.Label(style, text="size px").pack(side="left")
+        e = ttk.Entry(style, textvariable=self.var_ov_size, width=5, justify="right")
+        e.pack(side="left", padx=(2, 6))
+        e.bind("<Return>", self._on_ov_field)
+        e.bind("<FocusOut>", self._on_ov_field)
+        ToolTip(e, "Largest font size on the output canvas - long texts shrink to fit the box")
+        ttk.Label(style, text="color").pack(side="left")
+        self.btn_ov_color = tk.Button(style, width=2, relief="groove",
+                                      command=lambda: self.pick_color("color"))
+        self.btn_ov_color.pack(side="left", padx=(2, 6))
+        ttk.Checkbutton(style, text="box", variable=self.var_ov_bg_on,
+                        command=self._on_ov_field).pack(side="left")
+        self.btn_ov_bg = tk.Button(style, width=2, relief="groove",
+                                   command=lambda: self.pick_color("bg"))
+        self.btn_ov_bg.pack(side="left", padx=(2, 6))
+        ttk.Checkbutton(style, text="outline", variable=self.var_ov_outline,
+                        command=self._on_ov_field).pack(side="left")
+
+        row3 = ttk.Frame(f)
+        row3.grid(row=3, column=0, columnspan=3, sticky="w", pady=1)
+        ttk.Checkbutton(row3, text="visible", variable=self.var_ov_visible,
+                        command=self._on_ov_field).pack(side="left")
+        ttk.Label(row3, text="   align").pack(side="left")
+        cb = ttk.Combobox(row3, textvariable=self.var_ov_align, width=7, state="readonly",
+                          values=["left", "center", "right"])
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", self._on_ov_field)
+
+        # fields of the selected image
+        f = self.ov_image_frame = ttk.Frame(grp)
+        ttk.Checkbutton(f, text="visible", variable=self.var_ov_visible,
+                        command=self._on_ov_field).pack(side="left")
+        ttk.Button(f, text="Change…", command=self.change_image).pack(side="left", padx=6)
+        self.lbl_ov_path = ttk.Label(f, text="", foreground="#888")
+        self.lbl_ov_path.pack(side="left")
+
+        # sample values: only for this preview, each video gets its own in gui.py
+        sample = ttk.Frame(grp)
+        sample.grid(row=4, column=0, sticky="ew", padx=6, pady=(4, 6))
+        self.var_sample_title = tk.StringVar(value="NOW THIS IS SCIENCE")
+        self.var_sample_credit = tk.StringVar(value="CREATOR")
+        ttk.Label(sample, text="preview {title}").pack(side="left")
+        e = ttk.Entry(sample, textvariable=self.var_sample_title, width=18)
+        e.pack(side="left", padx=2, fill="x", expand=True)
+        e.bind("<KeyRelease>", lambda _e: self.draw_right())
+        ttk.Label(sample, text="{credit}").pack(side="left")
+        e = ttk.Entry(sample, textvariable=self.var_sample_credit, width=10)
+        e.pack(side="left", padx=2)
+        e.bind("<KeyRelease>", lambda _e: self.draw_right())
 
     # ---------------------------------------------------- videos/time
     def open_video(self) -> None:
@@ -436,6 +567,10 @@ class LayoutEditor:
         self.lbl_duration.configure(text=f"/ {fmt_time(self.duration)}   "
                                          f"(drag the slider, release to load the frame)")
         self._bg_cache = None
+        texts = ms.load_titles().get(path.name)  # preview with this video's own title, if typed
+        if texts:
+            self.var_sample_title.set(texts.get("title", ""))
+            self.var_sample_credit.set(texts.get("credit", ""))
 
         # a brand-new layout is seeded from the CONFIG block for THIS video
         frame = extract_frame(ffmpeg, path, self.time)
@@ -598,6 +733,7 @@ class LayoutEditor:
         self._snap = copy.deepcopy(self.layout)
         self._bg_cache = None
         self.selected = min(self.selected, len(self.layout["boxes"]) - 1)
+        self.ov_selected = min(self.ov_selected, len(self.layout["overlays"]) - 1)
         self.mark_dirty()
         self.refresh()
         self._sync_history_buttons()
@@ -633,6 +769,7 @@ class LayoutEditor:
     # --------------------------------------------------- box actions
     def select(self, index: int) -> None:
         self.selected = index
+        self.ov_selected = -1
         self._sync_listbox()
         self.refresh()
 
@@ -683,7 +820,7 @@ class LayoutEditor:
         if not messagebox.askyesno("Reset", "Replace the current layout with the defaults?"):
             return
         self.layout = ms.default_layout(self.src_w or 1920, self.src_h or 1080)
-        self.selected = -1
+        self.selected = self.ov_selected = -1
         self._after_edit()
         self._sync_listbox()
 
@@ -699,6 +836,186 @@ class LayoutEditor:
         sel = self.listbox.curselection()
         if sel and sel[0] != self.selected:
             self.select(sel[0])
+
+    # ---------------------------------------------- texts / images
+    def current_overlay(self) -> dict | None:
+        overlays = self.layout["overlays"]
+        if 0 <= self.ov_selected < len(overlays):
+            return overlays[self.ov_selected]
+        return None
+
+    def select_overlay(self, index: int) -> None:
+        self.ov_selected = index
+        self.selected = -1
+        self.refresh()
+
+    def _add_overlay(self, raw: dict) -> None:
+        self.layout["overlays_enabled"] = True
+        self.layout["overlays"].append(ms.normalize_overlay(raw, len(self.layout["overlays"])))
+        self.ov_selected = len(self.layout["overlays"]) - 1
+        self.selected = -1
+        self._after_edit()
+
+    def _on_overlays_toggle(self) -> None:
+        self.layout["overlays_enabled"] = bool(self.var_ov_on.get())
+        if self.layout["overlays_enabled"] and not self.layout["overlays"]:
+            # start from a credit line + a title, like most gameplay shorts
+            self.layout["overlays"] = ms.example_overlays()
+            self.ov_selected = len(self.layout["overlays"]) - 1
+            self.selected = -1
+        self._after_edit()
+
+    def add_text(self) -> None:
+        self._add_overlay({"type": "text", "text": "{title}",
+                           "out": {"x": 0.05, "y": 0.4, "w": 0.9, "h": 0.1}})
+
+    def _image_rect(self, path: str, w: float = 0.3) -> dict:
+        """A rectangle w wide with the image's own aspect ratio."""
+        out = self.layout["output"]
+        aspect = 1.0
+        try:
+            if Path(path).suffix.lower() in ms.VIDEO_EXTS:
+                still = ms._media_still(path, Path(path).stat().st_mtime)
+                if still is not None:
+                    aspect = still.height / still.width
+            else:
+                with Image.open(path) as img:
+                    aspect = img.height / img.width
+        except (OSError, ValueError):
+            pass
+        h = min(w * aspect * out["width"] / out["height"], 0.9)
+        return {"x": (1 - w) / 2, "y": max(0.0, 0.85 - h / 2), "w": w, "h": h}
+
+    def add_image(self) -> None:
+        path = filedialog.askopenfilename(title="Add an image", filetypes=IMAGE_TYPES)
+        if path:
+            self._add_overlay({"type": "image", "path": project_path(path),
+                               "out": self._image_rect(path)})
+
+    def change_image(self) -> None:
+        ov = self.current_overlay()
+        if ov is None or ov["type"] != "image":
+            return
+        path = filedialog.askopenfilename(title="Choose an image", filetypes=IMAGE_TYPES)
+        if path:
+            ov["path"] = project_path(path)
+            self._after_edit()
+
+    def remove_overlay(self) -> None:
+        ov = self.current_overlay()
+        if ov is None:
+            return
+        label = ov["text"] if ov["type"] == "text" else Path(ov["path"]).name
+        if not messagebox.askyesno("Remove", f"Remove '{label}'?"):
+            return
+        del self.layout["overlays"][self.ov_selected]
+        self.ov_selected = min(self.ov_selected, len(self.layout["overlays"]) - 1)
+        self._after_edit()
+
+    def move_overlay(self, delta: int) -> None:
+        i = self.ov_selected
+        j = i + delta
+        overlays = self.layout["overlays"]
+        if i < 0 or not (0 <= j < len(overlays)):
+            return
+        overlays[i], overlays[j] = overlays[j], overlays[i]
+        self.ov_selected = j
+        self._after_edit()
+
+    def center_overlay(self) -> None:
+        ov = self.current_overlay()
+        if ov is not None:
+            ov["out"]["x"] = max(0.0, (1.0 - ov["out"]["w"]) / 2)
+            self._after_edit()
+
+    def pick_color(self, key: str) -> None:
+        ov = self.current_overlay()
+        if ov is None or ov["type"] != "text":
+            return
+        _rgb, value = colorchooser.askcolor(ov[key], parent=self.root,
+                                            title="Text color" if key == "color" else "Box color")
+        if value:
+            ov[key] = value.upper()
+            if key == "bg":
+                ov["bg_enabled"] = True
+            self._after_edit()
+
+    def pick_font_file(self) -> None:
+        ov = self.current_overlay()
+        if ov is None or ov["type"] != "text":
+            return
+        path = filedialog.askopenfilename(title="Choose a font file",
+                                          filetypes=[("Fonts", "*.ttf *.otf *.ttc"), ("All files", "*.*")])
+        if path:
+            ov["font"] = project_path(path)
+            self._after_edit()
+
+    def _on_ov_field(self, _event=None) -> None:
+        ov = self.current_overlay()
+        if ov is None:
+            return
+        before = copy.deepcopy(ov)
+        ov["visible"] = bool(self.var_ov_visible.get())
+        if ov["type"] == "text":
+            ov["text"] = self.var_ov_text.get()
+            ov["font"] = self.fonts.get(self.var_ov_font.get(), ov["font"])
+            try:
+                ov["size"] = float(self.var_ov_size.get()) / self.layout["output"]["height"]
+            except ValueError:
+                pass
+            ov["bg_enabled"] = bool(self.var_ov_bg_on.get())
+            ov["outline"] = bool(self.var_ov_outline.get())
+            ov["align"] = self.var_ov_align.get()
+        if ov != before:
+            self._after_edit()
+
+    def _sync_overlay_fields(self) -> None:
+        self.var_ov_on.set(self.layout["overlays_enabled"])
+        ov = self.current_overlay()
+        kind = ov["type"] if ov else None
+        if kind != self._ov_kind_shown:  # swap the field set only when it changes
+            self.ov_text_frame.grid_remove()
+            self.ov_image_frame.grid_remove()
+            if kind == "text":
+                self.ov_text_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
+            elif kind == "image":
+                self.ov_image_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
+            self._ov_kind_shown = kind
+        if ov is None:
+            return
+        self.var_ov_visible.set(ov["visible"])
+        if kind == "image":
+            self.lbl_ov_path.configure(text=ov["path"] or "(no file)")
+            return
+        set_if_changed(self.var_ov_text, ov["text"])
+        set_if_changed(self.var_ov_font, self.font_names.get(ov["font"].lower(), ov["font"]))
+        set_if_changed(self.var_ov_size, f"{ov['size'] * self.layout['output']['height']:.0f}")
+        set_if_changed(self.var_ov_align, ov["align"])
+        self.var_ov_bg_on.set(ov["bg_enabled"])
+        self.var_ov_outline.set(ov["outline"])
+        self.btn_ov_color.configure(background=ov["color"], activebackground=ov["color"])
+        self.btn_ov_bg.configure(background=ov["bg"], activebackground=ov["bg"])
+
+    def _sync_ov_listbox(self) -> None:
+        self.ov_listbox.delete(0, "end")
+        for ov in self.layout["overlays"]:
+            if ov["type"] == "text":
+                label = f"T   {ov['text']}"
+            elif ms.is_media(ov):
+                label = f"▶   {Path(ov['path']).name}  (loops)"
+            else:
+                label = f"▣   {Path(ov['path']).name}"
+            self.ov_listbox.insert("end", label + ("" if ov["visible"] else "  (hidden)"))
+        if self.current_overlay() is not None:
+            self.ov_listbox.selection_set(self.ov_selected)
+
+    def _on_ov_list_select(self, _event=None) -> None:
+        sel = self.ov_listbox.curselection()
+        if sel and sel[0] != self.ov_selected:
+            self.select_overlay(sel[0])
+
+    def sample_values(self) -> dict:
+        return {"title": self.var_sample_title.get(), "credit": self.var_sample_credit.get()}
 
     # -------------------------------------------------- mouse / drag
     def _map(self, side: str) -> tuple[int, int, int, int]:
@@ -718,8 +1035,26 @@ class LayoutEditor:
         r = box[side]
         return x0 + r["x"] * w, y0 + r["y"] * h, r["w"] * w, r["h"] * h
 
+    def _selected_item(self, side: str) -> dict | None:
+        """The box - or, on the output side, the text/image - being edited."""
+        if side == "out" and self.current_overlay() is not None:
+            return self.current_overlay()
+        return self.current_box()
+
+    def _hit_overlay(self, event) -> int:
+        if not self.layout["overlays_enabled"]:
+            return -1
+        for i in range(len(self.layout["overlays"]) - 1, -1, -1):
+            ov = self.layout["overlays"][i]
+            if not ov["visible"]:
+                continue
+            x, y, w, h = self._rect_px("out", ov)
+            if x <= event.x <= x + w and y <= event.y <= y + h:
+                return i
+        return -1
+
     def _hit_handle(self, side: str, event) -> str | None:
-        box = self.current_box()
+        box = self._selected_item(side)
         if box is None:
             return None
         x, y, w, h = self._rect_px(side, box)
@@ -746,16 +1081,23 @@ class LayoutEditor:
             return
         handle = self._hit_handle(side, event)
         if handle is None:
-            index = self._hit_box(side, event)
-            if index < 0:
-                return
-            if index != self.selected:
-                self.select(index)
-                handle = self._hit_handle(side, event)
+            # texts/images sit on top of the boxes, so they are hit first
+            ov = self._hit_overlay(event) if side == "out" else -1
+            if ov >= 0:
+                if ov != self.ov_selected:
+                    self.select_overlay(ov)
+                    handle = self._hit_handle(side, event)
+            else:
+                index = self._hit_box(side, event)
+                if index < 0:
+                    return
+                if index != self.selected:
+                    self.select(index)
+                    handle = self._hit_handle(side, event)
             handle = handle or "move"
-        box = self.current_box()
+        box = self._selected_item(side)
         self.drag = {
-            "side": side, "mode": handle, "index": self.selected,
+            "side": side, "mode": handle,
             "start": self._frac_at(side, event),
             "rect0": dict(box[side]),
         }
@@ -763,7 +1105,7 @@ class LayoutEditor:
     def _on_motion(self, side: str, event) -> None:
         if self.drag is None or self.drag["side"] != side:
             return
-        box = self.current_box()
+        box = self._selected_item(side)
         if box is None:
             return
         fx, fy = self._frac_at(side, event)
@@ -886,6 +1228,11 @@ class LayoutEditor:
                 dh = max(2, round(o["h"] * ph))
             crop = crop.resize((dw, dh), Image.BILINEAR)
             canvas.paste(crop, (round(o["x"] * pw), round(o["y"] * ph)))
+
+        # texts/images: the very same drawing code the real render uses
+        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph))
+        if overlays is not None:
+            canvas.paste(overlays, (0, 0), overlays)
         return canvas
 
     def draw_right(self) -> None:
@@ -902,6 +1249,28 @@ class LayoutEditor:
         self._right_photo = ImageTk.PhotoImage(img.resize((dw, dh), Image.BILINEAR))
         c.create_image(x0, y0, image=self._right_photo, anchor="nw")
         self._draw_boxes("out")
+        self._draw_overlays()
+
+    def _draw_handles(self, c: tk.Canvas, x: float, y: float, w: float, h: float, color: str) -> None:
+        for px, py in ((x, y), (x + w / 2, y), (x + w, y), (x + w, y + h / 2),
+                       (x + w, y + h), (x + w / 2, y + h), (x, y + h), (x, y + h / 2)):
+            c.create_rectangle(px - HANDLE / 2, py - HANDLE / 2,
+                               px + HANDLE / 2, py + HANDLE / 2,
+                               fill=color, outline="#111", tags="ovl")
+
+    def _draw_overlays(self) -> None:
+        if not self.layout["overlays_enabled"]:
+            return
+        c = self.right_canvas
+        for i, ov in enumerate(self.layout["overlays"]):
+            if not ov["visible"]:
+                continue
+            x, y, w, h = self._rect_px("out", ov)
+            selected = i == self.ov_selected
+            c.create_rectangle(x, y, x + w, y + h, outline=OVERLAY_COLOR, dash=(4, 3),
+                               width=2 if selected else 1, tags="ovl")
+            if selected:
+                self._draw_handles(c, x, y, w, h, OVERLAY_COLOR)
 
     def _draw_boxes(self, side: str) -> None:
         c = self._canvas(side)
@@ -916,11 +1285,7 @@ class LayoutEditor:
             c.create_text(x + 5, y + 5, text=box["name"], anchor="nw", fill=color,
                           font=("", 9, "bold"), tags="ovl")
             if selected:
-                for px, py in ((x, y), (x + w / 2, y), (x + w, y), (x + w, y + h / 2),
-                               (x + w, y + h), (x + w / 2, y + h), (x, y + h), (x, y + h / 2)):
-                    c.create_rectangle(px - HANDLE / 2, py - HANDLE / 2,
-                                       px + HANDLE / 2, py + HANDLE / 2,
-                                       fill=color, outline="#111", tags="ovl")
+                self._draw_handles(c, x, y, w, h, color)
 
     def refresh(self) -> None:
         self._resize_job = None
@@ -928,6 +1293,8 @@ class LayoutEditor:
         self.draw_right()
         self.sync_fields()
         self._sync_listbox()
+        self._sync_overlay_fields()
+        self._sync_ov_listbox()
 
     # ------------------------------------------------- exact render
     def render_exact(self) -> None:
@@ -939,10 +1306,14 @@ class LayoutEditor:
             messagebox.showerror("ffmpeg not found",
                                  "Install ffmpeg or 'pip install imageio-ffmpeg'.")
             return
-        fc = ms.build_filter_complex_from_layout(self.layout)
         tmp = Path(tempfile.mkdtemp(prefix="ytshort_exact_"))
         dst = tmp / "exact.png"
-        cmd = ms.build_preview_cmd(ffmpeg, self.video, dst, fc, self.time)
+        try:
+            fc, extra = ms.filter_for_video(self.layout, self.sample_values(), tmp / "overlay")
+        except RuntimeError as exc:
+            messagebox.showerror("Texts / images", str(exc))
+            return
+        cmd = ms.build_preview_cmd(ffmpeg, self.video, dst, fc, self.time, extra)
         self.status.configure(text="rendering exact frame with ffmpeg…")
         self.root.config(cursor="watch")
         self.root.update_idletasks()
@@ -1008,7 +1379,7 @@ class LayoutEditor:
             messagebox.showerror("Bad layout file", str(exc))
             return
         self.layout_path = Path(path)
-        self.selected = -1
+        self.selected = self.ov_selected = -1
         self.dirty = False
         self._bg_cache = None
         self._history_reset()

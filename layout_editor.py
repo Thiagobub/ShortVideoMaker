@@ -48,6 +48,14 @@ BOX_COLORS = [
     "#d878ff", "#3fe0dd", "#ff9b3f", "#a6e84f",
 ]
 OVERLAY_COLOR = "#ffffff"  # outline of the text/image rectangles (dashed)
+# "Deadlock style" text: the in-game ability cards (cream text on a brick-red card)
+DEADLOCK_FONT = "fonts/deadlock/valvepulp-bold.ttf"
+DEADLOCK_TEXT, DEADLOCK_CARD = "#F4EBDD", "#A3473D"
+# "animate" dropdown: label -> (animate, anim_target); images only get off / on
+ANIM_TEXT_CHOICES = {"off": (False, "all"), "box + text": (True, "all"),
+                     "box + text (apart)": (True, "apart"),
+                     "box only": (True, "box"), "text only": (True, "text")}
+ANIM_IMAGE_CHOICES = {"off": (False, "all"), "on": (True, "all")}
 IMAGE_TYPES = [
     ("Images, GIFs and videos", "*.png *.jpg *.jpeg *.webp *.bmp *.gif "
      + " ".join(f"*{e}" for e in sorted(ms.VIDEO_EXTS))),
@@ -209,6 +217,7 @@ class LayoutEditor:
         self.right_map = (0, 0, 0, 0)
         self._left_cache: tuple | None = None   # (frame, w, h, photo)
         self._bg_cache: tuple | None = None     # (frame, w, h, zoom, blur, image)
+        self._base_cache: tuple | None = None   # (frame, key, preview without texts)
         self._resize_job = None
 
         self._build_ui()
@@ -220,6 +229,8 @@ class LayoutEditor:
             self.load_video(videos[0])
         else:
             self.refresh()
+        self.anim_step = 0  # wobble half-step shown by the live preview
+        self.root.after(500 // ms.ANIM_FPS, self._anim_tick)
 
     # ------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -301,62 +312,43 @@ class LayoutEditor:
             canvas.bind("<ButtonRelease-1>", lambda e, s=side: self._on_release(s, e))
             canvas.bind("<Configure>", self._on_resize)
 
-        # ---- bottom: boxes / fields / settings --------------------
+        # ---- bottom: elements / settings / fields ----------------
         bottom = ttk.Frame(self.root, padding=8)
         bottom.pack(side="bottom", fill="x")
         bottom.columnconfigure(0, weight=1)
-        bottom.columnconfigure(1, weight=2)
+        bottom.columnconfigure(1, weight=1)
         bottom.columnconfigure(2, weight=2)
-        bottom.columnconfigure(3, weight=2)
 
-        # boxes list
-        grp_boxes = ttk.LabelFrame(bottom, text="Boxes (top of list = bottom of the stack)")
-        grp_boxes.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.listbox = tk.Listbox(grp_boxes, height=6, exportselection=False)
+        # elements: the crop boxes and the texts/images in ONE list
+        # (top of the list = bottom of the stack; texts/images draw on top of all boxes)
+        grp_elems = ttk.LabelFrame(
+            bottom, text="Elements (top = bottom of the stack; texts / images on top)")
+        grp_elems.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.listbox = tk.Listbox(grp_elems, height=8, exportselection=False)
         self.listbox.pack(side="top", fill="x", padx=6, pady=6)
         self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
-        row = ttk.Frame(grp_boxes)
-        row.pack(side="top", fill="x", padx=6, pady=(0, 6))
-        for text, cmd in (("Add", self.add_box), ("Remove", self.remove_box),
-                          ("Rename", self.rename_box), ("↑", lambda: self.move_box(-1)),
-                          ("↓", lambda: self.move_box(1))):
-            ttk.Button(row, text=text, width=7, command=cmd).pack(side="left", padx=2)
-
-        # selected box fields
-        grp_box = ttk.LabelFrame(bottom, text="Selected box")
-        grp_box.grid(row=0, column=1, sticky="nsew", padx=6)
-        self.var_name = tk.StringVar(value="—")
-        ttk.Label(grp_box, textvariable=self.var_name, font=("", 10, "bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(6, 0))
-        self.var_visible = tk.BooleanVar(value=True)
-        self.var_keep_aspect = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grp_box, text="visible", variable=self.var_visible,
-                        command=self._on_toggle).grid(row=1, column=0, sticky="w", padx=6)
-        ttk.Checkbutton(grp_box, text="keep crop aspect for output height",
-                        variable=self.var_keep_aspect,
-                        command=self._on_toggle).grid(row=1, column=1, columnspan=3, sticky="w")
-
-        self.var_src = {k: tk.StringVar() for k in "xywh"}
-        self.var_out = {k: tk.StringVar() for k in "xywh"}
-        fields = (("SOURCE crop", self.var_src, 2), ("OUTPUT place", self.var_out, 5))
-        for label, vars_, row in fields:
-            ttk.Label(grp_box, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=(6, 0))
-            for col, key in enumerate("xywh"):
-                f = ttk.Frame(grp_box)
-                f.grid(row=row + 1, column=col, sticky="ew", padx=4)
-                ttk.Label(f, text=key, width=2).pack(side="left")
-                e = ttk.Entry(f, textvariable=vars_[key], width=8, justify="right")
-                e.pack(side="left")
-                e.bind("<Return>", lambda _e: self.apply_fields())
-                e.bind("<FocusOut>", lambda _e: self.apply_fields())
-        self.lbl_src_px = ttk.Label(grp_box, text="", foreground="#888")
-        self.lbl_src_px.grid(row=4, column=0, columnspan=4, sticky="w", padx=6)
-        self.lbl_out_px = ttk.Label(grp_box, text="", foreground="#888")
-        self.lbl_out_px.grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+        row = ttk.Frame(grp_elems)
+        row.pack(side="top", fill="x", padx=6)
+        for text, cmd, width in (("Add box", self.add_box, 8),
+                                 ("+ Text", self.add_text, 7),
+                                 ("+ Image/GIF", self.add_image, 11),
+                                 ("Remove", self.remove_selected_item, 8)):
+            btn = ttk.Button(row, text=text, width=width, command=cmd)
+            btn.pack(side="left", padx=1)
+            if text == "+ Image/GIF":
+                ToolTip(btn, "PNG/JPG, or a GIF / video that loops for the whole short "
+                             "(the preview shows its first frame)")
+        row = ttk.Frame(grp_elems)
+        row.pack(side="top", fill="x", padx=6, pady=(2, 6))
+        for text, cmd, width in (("Rename", self.rename_box, 8),
+                                 ("↑", lambda: self.move_item(-1), 3),
+                                 ("↓", lambda: self.move_item(1), 3),
+                                 ("⇔ center", self.center_overlay, 9)):
+            ttk.Button(row, text=text, width=width, command=cmd).pack(side="left", padx=1)
 
         # background + output settings
         grp_cfg = ttk.LabelFrame(bottom, text="Background & output")
-        grp_cfg.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+        grp_cfg.grid(row=0, column=1, sticky="nsew", padx=6)
         self.var_bg_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(grp_cfg, text="blurred background", variable=self.var_bg_on,
                         command=self._on_settings).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
@@ -394,10 +386,10 @@ class LayoutEditor:
         cb.pack(side="left", padx=2)
         cb.bind("<<ComboboxSelected>>", lambda _e: self.apply_fields())
 
-        self._build_overlay_ui(bottom)
+        self._build_fields_ui(bottom)
 
         self.status = ttk.Label(bottom, text="", foreground="#666")
-        self.status.grid(row=1, column=0, columnspan=4, sticky="w", padx=2, pady=(6, 0))
+        self.status.grid(row=1, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 0))
 
         self.root.bind("<Delete>", self._on_delete_key)
         self.root.bind("<Control-s>", lambda _e: self.save())
@@ -424,36 +416,34 @@ class LayoutEditor:
         return "break"
 
     def _on_delete_key(self, _event=None) -> None:
-        # don't delete a box while the user is typing in a text field
+        # don't delete an element while the user is typing in a text field
         focused = self.root.focus_get()
         if isinstance(focused, (tk.Entry, tk.Text, ttk.Entry)):
             return
-        if self.current_overlay() is not None:
-            self.remove_overlay()
-        else:
-            self.remove_box()
+        self.remove_selected_item()
 
-    def _build_overlay_ui(self, parent: ttk.Frame) -> None:
-        grp = ttk.LabelFrame(parent, text="Texts & images (drawn on top of everything)")
-        grp.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
+    def _build_fields_ui(self, parent: ttk.Frame) -> None:
+        """The editing fields of the selected element (crop box, text or image)."""
+        grp = ttk.LabelFrame(parent, text="Selected item")
+        grp.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
         grp.columnconfigure(0, weight=1)
         self.var_ov_on = tk.BooleanVar(value=False)
         ttk.Checkbutton(grp, text="this layout has texts / images", variable=self.var_ov_on,
                         command=self._on_overlays_toggle).grid(row=0, column=0, sticky="w",
                                                                padx=6, pady=(6, 0))
-        self.ov_listbox = tk.Listbox(grp, height=3, exportselection=False)
-        self.ov_listbox.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 2))
-        self.ov_listbox.bind("<<ListboxSelect>>", self._on_ov_list_select)
-        row = ttk.Frame(grp)
-        row.grid(row=2, column=0, sticky="w", padx=6)
-        for text, cmd, width in (("+ Text", self.add_text, 7), ("+ Image/GIF", self.add_image, 10),
-                                 ("Remove", self.remove_overlay, 7),
-                                 ("↑", lambda: self.move_overlay(-1), 3),
-                                 ("↓", lambda: self.move_overlay(1), 3),
-                                 ("⇔ center", self.center_overlay, 8)):
-            ttk.Button(row, text=text, width=width, command=cmd).pack(side="left", padx=1)
-        ToolTip(row.winfo_children()[1], "PNG/JPG, or a GIF / video that loops for the whole short "
-                                         "(the preview shows its first frame)")
+
+        # fields of the selected crop box (shown when a box is selected)
+        f = self.box_frame = ttk.Frame(grp)
+        self.var_name = tk.StringVar(value="—")
+        ttk.Label(f, textvariable=self.var_name, font=("", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.var_visible = tk.BooleanVar(value=True)
+        self.var_keep_aspect = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="visible", variable=self.var_visible,
+                        command=self._on_toggle).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(f, text="keep crop aspect for output height",
+                        variable=self.var_keep_aspect,
+                        command=self._on_toggle).grid(row=2, column=0, sticky="w")
 
         # fields of the selected text (shown when a text is selected)
         f = self.ov_text_frame = ttk.Frame(grp)
@@ -509,6 +499,10 @@ class LayoutEditor:
                           values=["left", "center", "right"])
         cb.pack(side="left", padx=2)
         cb.bind("<<ComboboxSelected>>", self._on_ov_field)
+        btn = ttk.Button(row3, text="Deadlock style", command=self.deadlock_style)
+        btn.pack(side="left", padx=(10, 0))
+        ToolTip(btn, "Cream text in a brick-red card, Valve Pulp font (from ./fonts/deadlock) "
+                     "- tick 'animate' too for the in-game wobble")
 
         # fields of the selected image
         f = self.ov_image_frame = ttk.Frame(grp)
@@ -536,10 +530,19 @@ class LayoutEditor:
         ToolTip(sb, "Degrees clockwise, around the center of the rectangle")
         ttk.Button(f, text="0°", width=3, command=lambda: self._on_ov_rotation(0)).grid(
             row=0, column=3, padx=(4, 0))
+        self.var_ov_anim = tk.StringVar(value="off")
+        ttk.Label(f, text="animate").grid(row=0, column=4, padx=(8, 2))
+        cb = self.combo_ov_anim = ttk.Combobox(f, textvariable=self.var_ov_anim, width=16,
+                                               state="readonly", values=list(ANIM_TEXT_CHOICES))
+        cb.grid(row=0, column=5)
+        cb.bind("<<ComboboxSelected>>", self._on_ov_field)
+        ToolTip(cb, f"Deadlock-style wobble: rocks smoothly top → middle → bottom → middle "
+                    f"(up to ±{ms.ANIM_DEGREES:g}° around 'rotate') {ms.ANIM_FPS}x a second - "
+                    f"the whole text, only its box or only the letters")
 
         # sample values: only for this preview, each video gets its own in gui.py
         sample = ttk.Frame(grp)
-        sample.grid(row=5, column=0, sticky="ew", padx=6, pady=(4, 6))
+        sample.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 6))
         self.var_sample_title = tk.StringVar(value="NOW THIS IS SCIENCE")
         self.var_sample_credit = tk.StringVar(value="CREATOR")
         ttk.Label(sample, text="preview {title}").pack(side="left")
@@ -607,7 +610,7 @@ class LayoutEditor:
         self.time = min(self.time, self.duration)
         self.lbl_duration.configure(text=f"/ {fmt_time(self.duration)}   "
                                          f"(drag the slider, release to load the frame)")
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         texts = ms.load_titles().get(path.name)  # preview with this video's own title, if typed
         if texts:
             self.var_sample_title.set(texts.get("title", ""))
@@ -660,7 +663,7 @@ class LayoutEditor:
         self.frame = frame
         self.src_w, self.src_h = frame.size
         self._left_cache = None
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self.refresh()
 
     # ----------------------------------------------------- box fields
@@ -678,7 +681,7 @@ class LayoutEditor:
         self.layout["background"]["blur"] = max(0.0, float(self.var_bg_blur.get()))
         self.lbl_zoom.configure(text=f"zoom {self.layout['background']['zoom']:.2f}")
         self.lbl_blur.configure(text=f"blur {self.layout['background']['blur']:.0f}")
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self._after_edit()
 
     def apply_fields(self) -> None:
@@ -691,38 +694,13 @@ class LayoutEditor:
             self.sync_fields()
             return
         self.layout["output"]["preset"] = self.var_preset.get()
-        box = self.current_box()
-        if box is not None:
-            try:
-                for rect_name, vars_ in (("src", self.var_src), ("out", self.var_out)):
-                    for key in "xywh":
-                        box[rect_name][key] = float(vars_[key].get())
-            except ValueError:
-                self.status.configure(text="box fields must be numbers - value ignored")
-                self.sync_fields()
-                return
         self._after_edit()
 
     def sync_fields(self) -> None:
         box = self.current_box()
-        for vars_, rect_name in ((self.var_src, "src"), (self.var_out, "out")):
-            for key in "xywh":
-                vars_[key].set(f"{box[rect_name][key]:.4f}" if box else "")
         self.var_name.set(box["name"] if box else "—")
         self.var_visible.set(bool(box["visible"]) if box else True)
         self.var_keep_aspect.set(bool(box["keep_aspect"]) if box else True)
-        if box and self.src_w:
-            s, o = box["src"], box["out"]
-            self.lbl_src_px.configure(
-                text=f"= px  x {s['x'] * self.src_w:.0f}   y {s['y'] * self.src_h:.0f}   "
-                     f"w {s['w'] * self.src_w:.0f}   h {s['h'] * self.src_h:.0f}")
-            out = self.layout["output"]
-            self.lbl_out_px.configure(
-                text=f"= px  x {o['x'] * out['width']:.0f}   y {o['y'] * out['height']:.0f}   "
-                     f"w {o['w'] * out['width']:.0f}   h {o['h'] * out['height']:.0f}")
-        else:
-            self.lbl_src_px.configure(text="")
-            self.lbl_out_px.configure(text="")
         self.var_out_w.set(str(self.layout["output"]["width"]))
         self.var_out_h.set(str(self.layout["output"]["height"]))
         self.var_crf.set(str(self.layout["output"]["crf"]))
@@ -772,7 +750,7 @@ class LayoutEditor:
     def _apply_state(self, state: dict) -> None:
         self.layout = ms.normalize_layout(copy.deepcopy(state))
         self._snap = copy.deepcopy(self.layout)
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self.selected = min(self.selected, len(self.layout["boxes"]) - 1)
         self.ov_selected = min(self.ov_selected, len(self.layout["overlays"]) - 1)
         self.mark_dirty()
@@ -869,14 +847,45 @@ class LayoutEditor:
         self.listbox.delete(0, "end")
         for box in self.layout["boxes"]:
             self.listbox.insert("end", box["name"] + ("" if box["visible"] else "  (hidden)"))
-        if 0 <= self.selected < len(self.layout["boxes"]):
+        for ov in self.layout["overlays"]:
+            if ov["type"] == "text":
+                label = f"T   {ov['text']}"
+            elif ms.is_media(ov):
+                label = f"▶   {Path(ov['path']).name}  (loops)"
+            else:
+                label = f"▣   {Path(ov['path']).name}"
+            self.listbox.insert("end", label + ("" if ov["visible"] else "  (hidden)"))
+        index = self.selected
+        if self.ov_selected >= 0:
+            index = len(self.layout["boxes"]) + self.ov_selected
+        if index >= 0:
             self.listbox.selection_clear(0, "end")
-            self.listbox.selection_set(self.selected)
+            self.listbox.selection_set(index)
 
     def _on_list_select(self, _event=None) -> None:
         sel = self.listbox.curselection()
-        if sel and sel[0] != self.selected:
-            self.select(sel[0])
+        if not sel:
+            return
+        index = sel[0]
+        boxes = len(self.layout["boxes"])
+        if index < boxes:
+            if index != self.selected:
+                self.select(index)
+        elif index - boxes != self.ov_selected:
+            self.select_overlay(index - boxes)
+
+    def remove_selected_item(self) -> None:
+        if self.current_overlay() is not None:
+            self.remove_overlay()
+        else:
+            self.remove_box()
+
+    def move_item(self, delta: int) -> None:
+        """Move the selected box among boxes / text-image among texts-images."""
+        if self.current_overlay() is not None:
+            self.move_overlay(delta)
+        else:
+            self.move_box(delta)
 
     # ---------------------------------------------- texts / images
     def current_overlay(self) -> dict | None:
@@ -888,6 +897,7 @@ class LayoutEditor:
     def select_overlay(self, index: int) -> None:
         self.ov_selected = index
         self.selected = -1
+        self._sync_listbox()
         self.refresh()
 
     def _add_overlay(self, raw: dict) -> None:
@@ -981,6 +991,27 @@ class LayoutEditor:
                 ov["bg_enabled"] = True
             self._after_edit()
 
+    def deadlock_style(self) -> None:
+        ov = self.current_overlay()
+        if ov is None or ov["type"] != "text":
+            return
+        if ms.resolve_font(DEADLOCK_FONT):
+            ov["font"] = DEADLOCK_FONT
+        else:
+            self.status.configure(text=f"{DEADLOCK_FONT} not found - kept the current font")
+        ov.update({"color": DEADLOCK_TEXT, "bg": DEADLOCK_CARD, "bg_enabled": True,
+                   "outline": False})
+        self._after_edit()
+
+    def _anim_tick(self) -> None:
+        """Step the wobble of animated texts/images in the live preview."""
+        self.root.after(500 // ms.ANIM_FPS, self._anim_tick)
+        if self.drag is not None or not self.layout["overlays_enabled"]:
+            return
+        if any(ov["visible"] and ov.get("animate") for ov in self.layout["overlays"]):
+            self.anim_step += 1
+            self.draw_right()
+
     def pick_font_file(self) -> None:
         ov = self.current_overlay()
         if ov is None or ov["type"] != "text":
@@ -997,6 +1028,9 @@ class LayoutEditor:
             return
         before = copy.deepcopy(ov)
         ov["visible"] = bool(self.var_ov_visible.get())
+        choices = ANIM_TEXT_CHOICES if ov["type"] == "text" else ANIM_IMAGE_CHOICES
+        if self.var_ov_anim.get() in choices:
+            ov["animate"], ov["anim_target"] = choices[self.var_ov_anim.get()]
         if ov["type"] == "text":
             ov["text"] = self.var_ov_text.get()
             if self.var_ov_font.get() not in self.fonts:  # a group header
@@ -1031,17 +1065,20 @@ class LayoutEditor:
     def _sync_overlay_fields(self) -> None:
         self.var_ov_on.set(self.layout["overlays_enabled"])
         ov = self.current_overlay()
-        kind = ov["type"] if ov else None
+        kind = ov["type"] if ov else ("box" if self.current_box() is not None else None)
         if kind != self._ov_kind_shown:  # swap the field set only when it changes
+            self.box_frame.grid_remove()
             self.ov_text_frame.grid_remove()
             self.ov_image_frame.grid_remove()
             self.ov_rot_frame.grid_remove()
-            if kind is not None:
-                self.ov_rot_frame.grid(row=4, column=0, sticky="ew", padx=6, pady=(4, 0))
+            if kind == "box":
+                self.box_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 0))
+            elif kind is not None:
+                self.ov_rot_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=(4, 0))
             if kind == "text":
-                self.ov_text_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
+                self.ov_text_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 0))
             elif kind == "image":
-                self.ov_image_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
+                self.ov_image_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 0))
             self._ov_kind_shown = kind
         if ov is None:
             return
@@ -1049,6 +1086,10 @@ class LayoutEditor:
         rotation = ov.get("rotation", 0)
         set_if_changed(self.var_ov_rot, float(rotation))
         set_if_changed(self.var_ov_rot_text, f"{rotation:g}")
+        choices = ANIM_TEXT_CHOICES if kind == "text" else ANIM_IMAGE_CHOICES
+        self.combo_ov_anim.configure(values=list(choices))
+        state = (ov.get("animate", False), ov.get("anim_target", "all") if kind == "text" else "all")
+        set_if_changed(self.var_ov_anim, next(k for k, v in choices.items() if v == state))
         if kind == "image":
             self.lbl_ov_path.configure(text=ov["path"] or "(no file)")
             return
@@ -1060,24 +1101,6 @@ class LayoutEditor:
         self.var_ov_outline.set(ov["outline"])
         self.btn_ov_color.configure(background=ov["color"], activebackground=ov["color"])
         self.btn_ov_bg.configure(background=ov["bg"], activebackground=ov["bg"])
-
-    def _sync_ov_listbox(self) -> None:
-        self.ov_listbox.delete(0, "end")
-        for ov in self.layout["overlays"]:
-            if ov["type"] == "text":
-                label = f"T   {ov['text']}"
-            elif ms.is_media(ov):
-                label = f"▶   {Path(ov['path']).name}  (loops)"
-            else:
-                label = f"▣   {Path(ov['path']).name}"
-            self.ov_listbox.insert("end", label + ("" if ov["visible"] else "  (hidden)"))
-        if self.current_overlay() is not None:
-            self.ov_listbox.selection_set(self.ov_selected)
-
-    def _on_ov_list_select(self, _event=None) -> None:
-        sel = self.ov_listbox.curselection()
-        if sel and sel[0] != self.ov_selected:
-            self.select_overlay(sel[0])
 
     def sample_values(self) -> dict:
         return {"title": self.var_sample_title.get(), "credit": self.var_sample_credit.get()}
@@ -1255,6 +1278,23 @@ class LayoutEditor:
         width, height = out["width"], out["height"]
         k = PREVIEW_H / height
         pw, ph = max(2, round(width * k)), max(2, round(height * k))
+        # background + boxes only change with the frame or the layout's boxes: the
+        # wobble redraws several times a second, so reuse them and redo just the texts
+        key = (pw, ph, repr(self.layout["background"]), repr(self.layout["boxes"]))
+        base = self._base_cache
+        if base is None or base[0] is not self.frame or base[1] != key:
+            self._base_cache = base = (self.frame, key, self._compose_base(pw, ph, k))
+        canvas = base[2].copy()
+
+        # texts/images: the very same drawing code the real render uses
+        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph),
+                                      step=getattr(self, "anim_step", 0))
+        if overlays is not None:
+            canvas.paste(overlays, (0, 0), overlays)
+        return canvas
+
+    def _compose_base(self, pw: int, ph: int, k: float) -> Image.Image:
+        """The preview without the texts/images: blurred background + boxes."""
         canvas = Image.new("RGB", (pw, ph), (0, 0, 0))
         if self.frame is None:
             return canvas
@@ -1293,11 +1333,6 @@ class LayoutEditor:
                 dh = max(2, round(o["h"] * ph))
             crop = crop.resize((dw, dh), Image.BILINEAR)
             canvas.paste(crop, (round(o["x"] * pw), round(o["y"] * ph)))
-
-        # texts/images: the very same drawing code the real render uses
-        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph))
-        if overlays is not None:
-            canvas.paste(overlays, (0, 0), overlays)
         return canvas
 
     def draw_right(self) -> None:
@@ -1367,7 +1402,6 @@ class LayoutEditor:
         self.sync_fields()
         self._sync_listbox()
         self._sync_overlay_fields()
-        self._sync_ov_listbox()
 
     # ------------------------------------------------- exact render
     def render_exact(self) -> None:
@@ -1382,7 +1416,8 @@ class LayoutEditor:
         tmp = Path(tempfile.mkdtemp(prefix="ytshort_exact_"))
         dst = tmp / "exact.png"
         try:
-            fc, extra = ms.filter_for_video(self.layout, self.sample_values(), tmp / "overlay")
+            fc, extra = ms.filter_for_video(self.layout, self.sample_values(), tmp / "overlay",
+                                            still=True)
         except RuntimeError as exc:
             messagebox.showerror("Texts / images", str(exc))
             return
@@ -1435,7 +1470,8 @@ class LayoutEditor:
     def save_as(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Save layout as", defaultextension=".json",
-            initialfile=self.layout_path.name, filetypes=[("Layout JSON", "*.json")])
+            initialdir=self.layout_path.parent, initialfile=self.layout_path.name,
+            filetypes=[("Layout JSON", "*.json")])
         if not path:
             return
         self.layout_path = Path(path)
@@ -1443,7 +1479,8 @@ class LayoutEditor:
 
     def load_from(self) -> None:
         path = filedialog.askopenfilename(
-            title="Load layout", filetypes=[("Layout JSON", "*.json"), ("All files", "*.*")])
+            title="Load layout", initialdir=Path(ms.CONFIGS_DIR),
+            filetypes=[("Layout JSON", "*.json"), ("All files", "*.*")])
         if not path:
             return
         try:
@@ -1454,7 +1491,7 @@ class LayoutEditor:
         self.layout_path = Path(path)
         self.selected = self.ov_selected = -1
         self.dirty = False
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self._history_reset()
         self._update_title()
         self.refresh()
@@ -1503,6 +1540,6 @@ if __name__ == "__main__":
     # allow running the editor directly: python layout_editor.py [file.json]
     ms.ensure_dirs()
     args = sys.argv[1:]
-    path = Path(args[0]) if args else Path(ms.DEFAULT_LAYOUT_NAME)
+    path = ms.config_file(args[0] if args else ms.DEFAULT_LAYOUT_NAME)
     candidates = ms.collect_inputs([ms.INPUT_DIR]) if Path(ms.INPUT_DIR).exists() else []
     sys.exit(run_editor(path, candidates))

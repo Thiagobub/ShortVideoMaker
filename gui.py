@@ -25,6 +25,7 @@ import tempfile
 import threading
 import tkinter as tk
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -37,7 +38,7 @@ import make_shorts as ms  # noqa: E402
 
 BUILTIN = "(CONFIG embutido)"
 BUILTIN_STEM = "config"  # output suffix for the built-in layout
-SETTINGS_FILE = HERE / ms.INPUT_DIR / "gui_settings.json"
+SETTINGS_FILE = HERE / ms.CONFIGS_DIR / "gui_settings.json"
 # layouts encoded by one ffmpeg run: the gameplay is decoded once for all of
 # them; capped so a long list doesn't exhaust GPU encoder sessions / memory
 MAX_OUTPUTS = 4
@@ -127,17 +128,17 @@ class App:
         self.btn_edit = ttk.Button(top, text="Editar layout ▾", command=self.edit_layout_menu)
         self.btn_edit.pack(side="left", padx=(0, 2))
         ttk.Button(top, text="↻", width=3, command=self.refresh_layouts).pack(side="left", padx=2)
+        ttk.Label(top, text="Saídas:").pack(side="left", padx=(12, 2))
+        # one tick per saved layout: every ticked one is a separate output
+        self.btn_outputs = ttk.Menubutton(top, text="—")
+        self.btn_outputs.pack(side="left")
+        self.menu_outputs = tk.Menu(self.btn_outputs, tearoff=False)
+        self.btn_outputs["menu"] = self.menu_outputs
         self.var_encoder = tk.StringVar(value="detectando GPU…")
         self.combo_encoder = ttk.Combobox(top, textvariable=self.var_encoder,
                                           state="disabled", width=26)
         self.combo_encoder.pack(side="right")
         ttk.Label(top, text="Aceleração:").pack(side="right", padx=(12, 4))
-
-        # one checkbox per saved layout: every ticked one is a separate output
-        self.frm_layouts = ttk.LabelFrame(
-            self.root, text="Saídas (um vídeo por layout marcado: nomeVideo_nomeLayout.mp4)",
-            padding=(6, 2))
-        self.frm_layouts.pack(fill="x", padx=8, pady=(0, 6))
 
         # ---- video list ----
         mid = ttk.LabelFrame(self.root, text="Vídeos", padding=6)
@@ -158,8 +159,8 @@ class App:
             side="left", expand=True, fill="x")
         ttk.Button(order, text="↓", width=3, command=lambda: self.move_selected(1)).pack(
             side="left", expand=True, fill="x")
-        ttk.Label(btns, text="Sem seleção =\nrenderiza todos\nos pendentes.\n\nDuplo clique =\n"
-                             "título, crédito\ne trecho.\n\n↑ ↓ = ordem ao\njuntar vídeos.",
+        ttk.Label(btns, text="Renderizar todos =\nlista inteira.\nSelecionado(s) =\nsó a seleção.\n\n"
+                             "Duplo clique =\ntítulo, crédito\ne trecho.\n\n↑ ↓ = ordem ao\njuntar vídeos.",
                   foreground="#888", justify="left").pack(fill="x", pady=(10, 0))
 
         self.tree = ttk.Treeview(mid, columns=("title", "credit", "trim", "status"),
@@ -205,12 +206,16 @@ class App:
         # ---- actions ----
         actions = ttk.Frame(self.root, padding=8)
         actions.pack(fill="x")
-        self.btn_render = ttk.Button(actions, text="▶ Renderizar", command=self.start_render)
-        self.btn_render.pack(side="left")
-        self.btn_cancel = ttk.Button(actions, text="■ Cancelar", command=self.cancel_render,
-                                     state="disabled")
+        self.btn_render_all = ttk.Button(actions, text="▶ Renderizar todos",
+                                         command=lambda: self.start_render(True))
+        self.btn_render_all.pack(side="left")
+        self.btn_render_sel = ttk.Button(actions, text="▶ Renderizar selecionado(s)",
+                                         command=lambda: self.start_render(False))
+        self.btn_render_sel.pack(side="left", padx=4)
         self.btn_join = ttk.Button(actions, text="⧉ Juntar selecionados", command=self.start_join)
         self.btn_join.pack(side="left", padx=4)
+        self.btn_cancel = ttk.Button(actions, text="■ Cancelar", command=self.cancel_render,
+                                     state="disabled")
         self.btn_cancel.pack(side="left", padx=4)
         ttk.Button(actions, text="Abrir pasta de saída", command=self.open_output).pack(side="right")
 
@@ -229,7 +234,8 @@ class App:
     def set_running(self, running: bool) -> None:
         """Lock the render buttons and the encoder choice while the worker runs."""
         idle = "disabled" if running else "normal"
-        self.btn_render.configure(state=idle)
+        self.btn_render_all.configure(state=idle)
+        self.btn_render_sel.configure(state=idle)
         self.btn_join.configure(state=idle)
         self.btn_cancel.configure(state="normal" if running else "disabled")
         if running:
@@ -272,22 +278,32 @@ class App:
             pass  # only a convenience: the ticks just won't be remembered
 
     def refresh_layouts(self) -> None:
-        """Rebuild the layout checkboxes from the *.json files, keeping the ticks."""
-        names = sorted(p.name for p in HERE.glob("*.json")) + [BUILTIN]
+        """Rebuild the outputs dropdown from the configs/*.json files, keeping the ticks."""
+        names = sorted(p.name for p in (HERE / ms.CONFIGS_DIR).glob("*.json")) + [BUILTIN]
         if not self.checked_layouts & set(names):  # first run, or the ticked files are gone
             self.checked_layouts = {ms.DEFAULT_LAYOUT_NAME if ms.DEFAULT_LAYOUT_NAME in names
                                     else BUILTIN}
-        for child in self.frm_layouts.winfo_children():
-            child.destroy()
+        self.menu_outputs.delete(0, "end")
         self.layout_vars = {}
-        cols = 4
-        for i, name in enumerate(names):
+        for name in names:
             var = tk.BooleanVar(value=name in self.checked_layouts)
             var.trace_add("write", lambda *_a, n=name: self.toggle_layout(n))
             label = name if name == BUILTIN else Path(name).stem
-            ttk.Checkbutton(self.frm_layouts, text=label, variable=var).grid(
-                row=i // cols, column=i % cols, sticky="w", padx=(0, 16))
+            self.menu_outputs.add_checkbutton(label=label, variable=var)
             self.layout_vars[name] = var
+        self.menu_outputs.add_separator()
+        self.menu_outputs.add_command(
+            label="um vídeo por layout marcado: nomeVideo_nomeLayout.mp4", state="disabled")
+        self._update_outputs_label()
+
+    def _update_outputs_label(self) -> None:
+        """Show the ticked layouts on the dropdown button itself."""
+        labels = [n if n == BUILTIN else Path(n).stem
+                  for n, var in self.layout_vars.items() if var.get()]
+        text = ", ".join(labels) if labels else "(nenhuma)"
+        if len(text) > 40:
+            text = f"{len(labels)} marcadas"
+        self.btn_outputs.configure(text=f"Saídas: {text} ▾")
 
     def toggle_layout(self, name: str) -> None:
         if self.layout_vars[name].get():
@@ -295,6 +311,7 @@ class App:
         else:
             self.checked_layouts.discard(name)
         self.save_settings()
+        self._update_outputs_label()
 
     def selected_layouts(self) -> list[tuple[str, dict | None]]:
         """(output suffix, layout) for every ticked layout; None = built-in CONFIG.
@@ -306,7 +323,7 @@ class App:
             if name == BUILTIN:
                 result.append((BUILTIN_STEM, None))
             else:
-                result.append((Path(name).stem, ms.load_layout(HERE / name)))
+                result.append((Path(name).stem, ms.load_layout(ms.config_file(name))))
         return result
 
     def texts_for(self, path: Path) -> dict:
@@ -339,7 +356,7 @@ class App:
 
     def edit_layout(self, name: str) -> None:
         target = ms.DEFAULT_LAYOUT_NAME if name == BUILTIN else name
-        cmd = [sys.executable, str(HERE / "make_shorts.py"), "--config", target]
+        cmd = [sys.executable, str(HERE / "make_shorts.py"), "--config", str(ms.config_file(target))]
         cmd += [str(p) for p in self.selected_paths()]  # editor defaults to input/
         proc = subprocess.Popen(cmd)
 
@@ -507,51 +524,105 @@ class App:
         if at is None:
             return
         src = paths[0]
-        tmp = Path(tempfile.mkdtemp(prefix="shorts_preview_"))
-        out = self.output_dir()
-        out.mkdir(parents=True, exist_ok=True)
-        cmds = []
         try:
-            for stem, layout in self.selected_layouts():
-                fc, extra = ms.filter_for_video(layout, self.texts_for(src), tmp / stem)
-                dst = out / f"{src.stem}_{stem}_preview_{at:g}s.png"
-                cmds.append((dst, ms.build_preview_cmd(self.ffmpeg, src, dst, fc, at, extra)))
+            layouts = self.selected_layouts()
         except Exception as exc:
-            shutil.rmtree(tmp, ignore_errors=True)
             messagebox.showerror("Layout", str(exc))
             return
-        if not cmds:
-            shutil.rmtree(tmp, ignore_errors=True)
+        if not layouts:
             messagebox.showinfo("Prévia", "Marque pelo menos um layout em Saídas.")
             return
-        self.log(f"[prévia] {src.name} @ {at:g}s ({len(cmds)} layout(s))")
+        texts = self.texts_for(src)
+        self.log(f"[prévia] {src.name} @ {at:g}s ({len(layouts)} layout(s))")
 
         def run() -> None:
-            for dst, cmd in cmds:
+            """Off the UI thread: draw the overlays (first wobble pose only - it's a
+            single frame), then one ffmpeg per layout, all at once - into a temp
+            folder, shown by a popup with a "Salvar como .png" button."""
+            tmp = Path(tempfile.mkdtemp(prefix="shorts_preview_"))
+            procs = []
+            for stem, layout in layouts:
+                dst = tmp / f"{stem}.png"
                 dst.unlink(missing_ok=True)
-                result = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                                        stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
-                if result.returncode == 0 and dst.exists():
-                    self.events.put(("open", dst))
+                try:
+                    fc, extra = ms.filter_for_video(layout, texts, tmp / stem, still=True)
+                    cmd = ms.build_preview_cmd(self.ffmpeg, src, dst, fc, at, extra)
+                    procs.append((stem, dst, subprocess.Popen(
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                        errors="replace", stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)))
+                except Exception as exc:
+                    self.events.put(("log", f"[prévia falhou] {stem}: {exc}"))
+            shots = []
+            for stem, dst, proc in procs:
+                _, err = proc.communicate()
+                if proc.returncode == 0 and dst.exists():
+                    shots.append((stem, dst))
                 else:
-                    tail = "\n".join(result.stderr.strip().splitlines()[-8:])
-                    self.events.put(("log", f"[prévia falhou] {dst.name}\n{tail}"))
-            shutil.rmtree(tmp, ignore_errors=True)
+                    tail = "\n".join(err.strip().splitlines()[-8:])
+                    self.events.put(("log", f"[prévia falhou] {stem}\n{tail}"))
+            if shots:
+                self.events.put(("preview", src.name, at, shots, tmp))
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
 
         threading.Thread(target=run, daemon=True).start()
 
+    def show_preview(self, name: str, at: float, shots: list[tuple[str, Path]],
+                     tmp: Path) -> None:
+        """Popup with the rendered frame(s); nothing is written to the output
+        folder unless the user clicks "Salvar como .png"."""
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            messagebox.showerror("Prévia", "A prévia precisa de Pillow: "
+                                           "python -m pip install pillow")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Prévia — {name} @ {fmt_time(at)}")
+        win.transient(self.root)
+
+        def close() -> None:
+            shutil.rmtree(tmp, ignore_errors=True)
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        row = ttk.Frame(win, padding=10)
+        row.pack()
+        height = 620 if len(shots) == 1 else 400
+        for stem, png in shots:
+            col = ttk.Frame(row)
+            col.pack(side="left", padx=8)
+            ttk.Label(col, text=stem, font=("", 10, "bold")).pack()
+            with Image.open(png) as img:
+                width = max(2, round(height * img.width / img.height))
+                photo = ImageTk.PhotoImage(img.resize((width, height), Image.BILINEAR))
+            label = ttk.Label(col, image=photo)
+            label.pack(pady=4)
+            label.photo = photo  # keep a reference
+            ttk.Button(col, text="Salvar como .png…",
+                       command=lambda p=png, s=stem: self.save_preview_png(p, s, name, at)).pack()
+
+    def save_preview_png(self, png: Path, stem: str, name: str, at: float) -> None:
+        dst = filedialog.asksaveasfilename(
+            title="Salvar prévia", defaultextension=".png",
+            initialfile=f"{Path(name).stem}_{stem}_{at:g}s.png",
+            filetypes=[("PNG", "*.png")])
+        if dst:
+            shutil.copyfile(png, dst)
+            self.log(f"[prévia salva] {dst}")
+
     # --------------------------------------------------------- render --
-    def start_render(self) -> None:
+    def start_render(self, all_items: bool = False) -> None:
+        """Render the whole list ("Renderizar todos") or just the selected rows."""
         if self.busy():
             return
         if not self.ffmpeg:
             messagebox.showerror("Renderizar", "ffmpeg não encontrado.")
             return
-        items = list(self.tree.selection()) or [
-            iid for iid in self.tree.get_children() if self.tree.set(iid, "status") != ST_DONE
-        ]
+        items = list(self.tree.get_children()) if all_items else list(self.tree.selection())
         if not items:
-            messagebox.showinfo("Renderizar", "Nenhum vídeo pendente na lista.")
+            messagebox.showinfo("Renderizar", "Selecione um ou mais vídeos na lista.")
             return
         try:
             layouts = self.selected_layouts()
@@ -592,14 +663,21 @@ class App:
         """Worker thread: renders jobs one by one, reports through self.events."""
         done = failed = 0
         tmp = Path(tempfile.mkdtemp(prefix="shorts_overlay_"))
+
+        def prepare(n: int, src: Path, texts: dict) -> list[tuple[Path, str, list[str]]]:
+            return [(out_dir / f"{src.stem}_{stem}.mp4",
+                     *ms.filter_for_video(layout, texts, tmp / f"{n}_{stem}"))
+                    for stem, layout in layouts]
+
+        # the overlays (every wobble pose of every layout) are drawn ahead, video
+        # by video, on another thread: from the 2nd video on ffmpeg starts right away
+        pool = ThreadPoolExecutor(max_workers=1)
+        ready = [pool.submit(prepare, n, src, texts) for n, (_, src, texts, _) in enumerate(jobs)]
         for n, (iid, src, texts, trim) in enumerate(jobs):
             if self.cancel.is_set():
                 break
-            outputs = []
             try:
-                for stem, layout in layouts:
-                    fc, extra = ms.filter_for_video(layout, texts, tmp / f"{n}_{stem}")
-                    outputs.append((out_dir / f"{src.stem}_{stem}.mp4", fc, extra))
+                outputs = ready[n].result()
             except Exception as exc:
                 self.events.put(("log", f"[erro]   textos/imagens de {src.name}: {exc}"))
                 failed += 1
@@ -624,6 +702,7 @@ class App:
             else:
                 failed += 1
                 self.events.put(("status", iid, ST_FAILED))
+        pool.shutdown(wait=True, cancel_futures=True)  # before deleting its files
         shutil.rmtree(tmp, ignore_errors=True)
         self.events.put(("finished", done, failed, len(jobs)))
 
@@ -859,9 +938,8 @@ class App:
                 msg = f"Pronto: {done} concluído(s)" + (f", {failed} com erro." if failed else ".")
             self.lbl_status.configure(text=msg)
             self.log(msg)
-        elif kind == "open":
-            self.log(f"[prévia] {args[0]}")
-            open_path(args[0])
+        elif kind == "preview":
+            self.show_preview(*args)
         elif kind == "layouts":
             self.refresh_layouts()
         elif kind == "encoders":

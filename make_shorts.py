@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 # ============================== CONFIG =================================
@@ -83,6 +84,7 @@ CONVERTED_DIR = "input/converted"  # originals are moved here after a successful
 OUTPUT_DIR = "output"              # default output folder
 PUBLISHED_DIR = "output/published"  # move finished shorts here after uploading them
 
+CONFIGS_DIR = "configs"              # layouts + per-machine settings (gitignored)
 DEFAULT_LAYOUT_NAME = "layout.json"  # written by --config, read when rendering
 
 # ---- ENCODERS: GPU acceleration, with the CPU (x264) as the fallback ---
@@ -95,7 +97,7 @@ ENCODERS = {  # key -> label shown to the user
 GPU_ORDER = ("nvidia", "amd", "intel")  # "auto" picks the first one that works
 
 # ---- OVERLAYS: texts/images drawn on top of the short ----------------
-TITLES_FILE = "input/titles.json"  # per-video {title}/{credit} values, typed in gui.py
+TITLES_FILE = str(Path(CONFIGS_DIR) / "titles.json")  # per-video {title}/{credit} values, typed in gui.py
 FONTS_DIR = "fonts"                # optional extra .ttf/.otf files for the overlays
 DEFAULT_FONT = "impact.ttf"        # ships with Windows
 # ======================================================================
@@ -299,6 +301,15 @@ def normalize_layout(raw: dict) -> dict:
 
 FONT_EXTS = {".ttf", ".otf", ".ttc"}
 ANIMATED_EXTS = {".gif"} | VIDEO_EXTS
+
+# "animate": the rocking wobble of Deadlock's ability cards - the item tilts
+# smoothly through top -> middle -> bottom -> middle and repeats (the cycle
+# never jumps back to its start), one step every 1/ANIM_FPS s
+ANIM_FPS = 2          # wobble steps per second
+ANIM_DEGREES = 4.0    # largest tilt added, either way
+ANIM_POSES = 4        # steps of one see-saw: top, middle, bottom, middle
+# what wobbles on a text: box + text in sync, box + text each on its own, box, text
+ANIM_TARGETS = ("all", "apart", "box", "text")
 HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 
 
@@ -317,6 +328,8 @@ def normalize_overlay(raw: dict, i: int) -> dict:
         "out": {"x": clamp01(r.get("x", 0)), "y": clamp01(r.get("y", 0)), "w": w, "h": h},
         # degrees clockwise around the rectangle's center, kept in -180..180
         "rotation": (float(raw.get("rotation", 0)) + 180) % 360 - 180,
+        "animate": bool(raw.get("animate", False)),
+        "anim_target": raw.get("anim_target") if raw.get("anim_target") in ANIM_TARGETS else "all",
     }
     if kind == "image":
         ov["path"] = str(raw.get("path", ""))
@@ -455,37 +468,19 @@ def _wrap(draw, text: str, font, width: float) -> list[str]:
     return lines
 
 
-def _composite(canvas, layer, ov: dict) -> None:
-    """Lay one overlay's full-canvas layer on the canvas, turned by its rotation
-    around the center of its rectangle (the content is laid out unrotated first)."""
-    from PIL import Image
-
-    if ov.get("rotation"):
-        cw, ch = canvas.size
-        r = ov["out"]
-        center = ((r["x"] + r["w"] / 2) * cw, (r["y"] + r["h"] / 2) * ch)
-        layer = layer.rotate(-ov["rotation"], resample=Image.BICUBIC, center=center)
-    canvas.alpha_composite(layer)
-
-
-def _draw_text(canvas, ov: dict, values: dict) -> None:
+@functools.lru_cache(maxsize=256)
+def _fit_text(text: str, font_name: str, size: int, bw: float, bh: float, bg_enabled: bool,
+              outline: bool) -> tuple:
+    """Largest size <= `size` whose wrapped text fits a bw x bh rectangle:
+    (font, pad, stroke, lines, widths, line height, block w, block h). Cached: the
+    editor redraws the same texts several times a second while they wobble."""
     from PIL import Image, ImageDraw
 
-    text = fill_text(ov["text"], values)
-    if text is None:
-        return
-    cw, ch = canvas.size
-    r = ov["out"]
-    bx, by, bw, bh = r["x"] * cw, r["y"] * ch, r["w"] * cw, r["h"] * ch
-    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-
-    # largest size <= the requested one whose wrapped text fits the rectangle
-    size = max(4, round(ov["size"] * ch))
+    draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     while True:
-        font = load_font(ov["font"], size)
-        pad = round(size * 0.3) if ov["bg_enabled"] else 0
-        stroke = max(1, round(size * 0.08)) if ov["outline"] else 0
+        font = load_font(font_name, size)
+        pad = round(size * 0.3) if bg_enabled else 0
+        stroke = max(1, round(size * 0.08)) if outline else 0
         lines = _wrap(draw, text, font, bw - 2 * pad)
         ascent, descent = font.getmetrics()
         line_h = ascent + descent
@@ -493,29 +488,134 @@ def _draw_text(canvas, ov: dict, values: dict) -> None:
         block_w = max(widths) + 2 * pad
         block_h = line_h * len(lines) + 2 * pad
         if (block_w <= bw and block_h <= bh) or size <= 4:
-            break
+            return font, pad, stroke, lines, widths, line_h, block_w, block_h
         size = max(4, int(size * 0.92))
 
-    if ov["align"] == "left":
+
+# Overlay pieces are drawn only as big as what they show and cached, and every
+# turn of a piece is cached too: a wobbling item repeats the same few poses (and
+# its other part often doesn't move at all), so each pose is drawn and turned
+# once instead of on every frame of the editor preview / every pose of a render.
+@functools.lru_cache(maxsize=64)
+def _text_pieces(text: str, font_name: str, size: int, color: str, bg_enabled: bool, bg: str,
+                 outline: bool, align: str, rect: tuple[float, float, float, float]) -> tuple:
+    """(box, letters, both, origin) of a text laid out in rect = (x, y, w, h) canvas
+    pixels: images just as big as the drawn block (+ a margin for glyph overhangs),
+    all with their top-left corner at `origin` on the canvas. box is None without
+    a background; both = the letters on the box."""
+    from PIL import Image, ImageDraw
+
+    bx, by, bw, bh = rect
+    font, pad, stroke, lines, widths, line_h, block_w, block_h = _fit_text(
+        text, font_name, size, bw, bh, bg_enabled, outline)
+    if align == "left":
         x0 = bx
-    elif ov["align"] == "right":
+    elif align == "right":
         x0 = bx + bw - block_w
     else:
         x0 = bx + (bw - block_w) / 2
     y0 = by + (bh - block_h) / 2
-    if ov["bg_enabled"]:
-        draw.rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=ov["bg"])
+    margin = max(4, size // 3)
+    ox, oy = math.floor(x0) - margin, math.floor(y0) - margin
+    w, h = math.ceil(x0 + block_w) + margin - ox, math.ceil(y0 + block_h) + margin - oy
+    x0, y0 = x0 - ox, y0 - oy  # from here on, in the pieces' coordinates
+
+    box = None
+    if bg_enabled:
+        box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(box).rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=bg)
+    letters = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(letters)
     inner_w = block_w - 2 * pad
     for i, (line, lw) in enumerate(zip(lines, widths)):
-        if ov["align"] == "left":
+        if align == "left":
             lx = x0 + pad
-        elif ov["align"] == "right":
+        elif align == "right":
             lx = x0 + pad + inner_w - lw
         else:
             lx = x0 + pad + (inner_w - lw) / 2
-        draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=ov["color"],
+        draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=color,
                   stroke_width=stroke, stroke_fill="#000000")
-    _composite(canvas, layer, ov)
+    both = letters if box is None else Image.alpha_composite(box, letters)
+    return box, letters, both, (ox, oy)
+
+
+@functools.lru_cache(maxsize=32)
+def _image_piece(path: str, mtime: float, rect: tuple[float, float, float, float]) -> tuple:
+    """(picture fitted inside rect keeping its aspect, origin) - a video/GIF shows
+    its first frame - or (None, None) when the file can't be read."""
+    from PIL import Image
+
+    try:
+        if Path(path).suffix.lower() in VIDEO_EXTS:
+            img = _media_still(path, mtime)
+            if img is None:
+                return None, None
+        else:
+            img = Image.open(path).convert("RGBA")
+    except (OSError, ValueError):
+        return None, None
+    bx, by, bw, bh = rect
+    scale = min(bw / img.width, bh / img.height)
+    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+    return img.resize(size, Image.LANCZOS), (round(bx + (bw - size[0]) / 2), round(by + (bh - size[1]) / 2))
+
+
+@functools.lru_cache(maxsize=96)
+def _turned(maker, args: tuple, part: int, angle: float):
+    """Piece `part` of maker(*args), turned `angle` degrees clockwise about its own
+    center (grown to fit)."""
+    from PIL import Image
+
+    return maker(*args)[part].rotate(-angle, resample=Image.BICUBIC, expand=True)
+
+
+def _composite(canvas, maker, args: tuple, part: int, pivot: tuple[float, float],
+               angle: float) -> None:
+    """Lay piece `part` of maker(*args) (an image + its canvas origin, see
+    _text_pieces) on the canvas, turned `angle` degrees clockwise about `pivot` -
+    the center of the overlay's rectangle."""
+    pieces = maker(*args)
+    img = pieces[part]
+    if img is None:
+        return
+    ox, oy = pieces[-1]
+    if angle:
+        w, h = img.size
+        img = _turned(maker, args, part, angle)
+        # the piece's center swings around the pivot (y points down: clockwise)
+        a = math.radians(angle)
+        cx, cy = ox + w / 2 - pivot[0], oy + h / 2 - pivot[1]
+        ox = round(pivot[0] + cx * math.cos(a) - cy * math.sin(a) - img.width / 2)
+        oy = round(pivot[1] + cx * math.sin(a) + cy * math.cos(a) - img.height / 2)
+    # alpha_composite takes no negative destination: cut off what is left of / above the canvas
+    sx, sy = max(0, -ox), max(0, -oy)
+    if sx < img.width and sy < img.height:
+        canvas.alpha_composite(img, dest=(ox + sx, oy + sy), source=(sx, sy))
+
+
+def _rect_px(canvas, ov: dict) -> tuple[float, float, float, float]:
+    cw, ch = canvas.size
+    r = ov["out"]
+    return r["x"] * cw, r["y"] * ch, r["w"] * cw, r["h"] * ch
+
+
+def _draw_text(canvas, ov: dict, values: dict) -> None:
+    text = fill_text(ov["text"], values)
+    if text is None:
+        return
+    rect = _rect_px(canvas, ov)
+    pivot = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+    args = (text, ov["font"], max(4, round(ov["size"] * canvas.size[1])), ov["color"],
+            ov["bg_enabled"], ov["bg"], ov["outline"], ov["align"], rect)
+    rotation = ov.get("rotation", 0)
+    box_tilt, text_tilt = ov.get("_tilt_box", 0.0), ov.get("_tilt_text", 0.0)
+    if ov["bg_enabled"] and box_tilt != text_tilt:  # the box wobbles apart from the letters
+        _composite(canvas, _text_pieces, args, 0, pivot, rotation + box_tilt)
+        _composite(canvas, _text_pieces, args, 1, pivot, rotation + text_tilt)
+    else:
+        tilt = box_tilt if ov["bg_enabled"] else text_tilt
+        _composite(canvas, _text_pieces, args, 2, pivot, rotation + tilt)
 
 
 def is_media(ov: dict) -> bool:
@@ -544,36 +644,66 @@ def _media_still(path: str, mtime: float):
 
 
 def _draw_image(canvas, ov: dict) -> None:
-    from PIL import Image
-
     path = Path(ov["path"])
     try:
-        if path.suffix.lower() in VIDEO_EXTS:
-            img = _media_still(str(path), path.stat().st_mtime)
-            if img is None:
-                return
-        else:
-            img = Image.open(path).convert("RGBA")  # a GIF shows its first frame
-    except (OSError, ValueError):
+        mtime = path.stat().st_mtime
+    except OSError:
         return
-    cw, ch = canvas.size
-    r = ov["out"]
-    bw, bh = r["w"] * cw, r["h"] * ch
-    scale = min(bw / img.width, bh / img.height)  # fit inside the rectangle, keep aspect
-    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
-    img = img.resize(size, Image.LANCZOS)
-    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    layer.paste(img, (round(r["x"] * cw + (bw - size[0]) / 2), round(r["y"] * ch + (bh - size[1]) / 2)))
-    _composite(canvas, layer, ov)
+    rect = _rect_px(canvas, ov)
+    pivot = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+    _composite(canvas, _image_piece, (str(path), mtime, rect), 0, pivot,
+               ov.get("rotation", 0) + ov.get("_tilt_box", 0.0))
 
 
-def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None):
+@functools.lru_cache(maxsize=256)
+def wobble_tilts(seed: int) -> tuple[float, ...]:
+    """The ANIM_POSES tilts of one item: a smooth see-saw (top, middle, bottom,
+    middle, then repeat) so the loop never jumps back to its start; each item
+    starts at its own point of the cycle (seeded by its place in the list, so
+    every item wobbles on its own)."""
+    wave = (ANIM_DEGREES, 0.0, -ANIM_DEGREES, 0.0)  # top, middle, bottom, middle (== ANIM_POSES)
+    return tuple(wave[(k + seed) % ANIM_POSES] for k in range(ANIM_POSES))
+
+
+def wobble_pose(ov: dict, seed: int, step: int) -> dict:
+    """The overlay as drawn at wobble half-step `step` (2 per pose; unchanged when it
+    isn't animated): the tilt goes to the box and/or the text of a text as its
+    anim_target says (an image is all "box"). "apart" gives the text tilts of its
+    own that change half a pose after the box's, so the two never move together."""
+    if not ov.get("animate"):
+        return ov
+    tilt = wobble_tilts(seed)[step // 2 % ANIM_POSES]
+    target = ov.get("anim_target", "all") if ov["type"] == "text" else "all"
+    if target == "apart":
+        # one step of the see-saw ahead + half a pose late: the letters change
+        # between the box's moves, so the two never move together
+        text_tilt = wobble_tilts(seed + 1)[(step + 1) // 2 % ANIM_POSES]
+        return {**ov, "_tilt_box": tilt, "_tilt_text": text_tilt}
+    return {**ov, "_tilt_box": tilt if target in ("all", "box") else 0.0,
+            "_tilt_text": tilt if target in ("all", "text") else 0.0}
+
+
+# the cached fonts and pieces are shared: one thread draws at a time (the GUI
+# prepares the next video's overlays while ffmpeg renders, and may run a preview)
+_DRAW_LOCK = threading.RLock()
+
+
+def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None,
+                    step: int = 0):
     """Overlays on a transparent RGBA image of `size`, or None. By default all the
-    layout's visible ones (GIFs/videos as their first frame, for previews)."""
+    layout's visible ones (GIFs/videos as their first frame, animated ones at wobble
+    half-step `step`, for previews); `items` are drawn exactly as given."""
+    with _DRAW_LOCK:
+        return _render_overlays(layout, values, size, items, step)
+
+
+def _render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None,
+                     step: int):
     if items is None:
         if not layout.get("overlays_enabled"):
             return None
-        items = [ov for ov in layout.get("overlays", []) if ov["visible"]]
+        items = [wobble_pose(ov, i, step) for i, ov in enumerate(layout.get("overlays", []))
+                 if ov["visible"]]
     if not items:
         return None
     try:
@@ -589,11 +719,16 @@ def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: li
     return canvas
 
 
-def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, list[str]]:
+def overlay_layers(layout: dict, values: dict, tmp_prefix: Path,
+                   still: bool = False) -> tuple[list, list[str]]:
     """Split one video's overlays into ffmpeg layers, keeping their stacking order.
+    still=True (a single-frame preview) draws animated texts/stills in their first
+    pose instead of preparing every pose.
 
     Returns (layers, input args): one layer per extra input (1, 2, ...) - None for a
-    full-canvas PNG of consecutive texts/stills, or the GIF/video overlay dict."""
+    full-canvas PNG of consecutive texts/stills, {"anim", "x", "y"} for the looped
+    wobble poses of an animated text/still (cropped PNGs placed at x, y), or the
+    GIF/video overlay dict (plus its "seed" for the wobble)."""
     if not layout.get("overlays_enabled"):
         return [], []
     out = layout["output"]
@@ -606,31 +741,61 @@ def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, 
         img = render_overlays(layout, values, size, run) if run else None
         if img is not None and img.getbbox() is not None:
             png = tmp_prefix.with_name(f"{tmp_prefix.name}_{len(layers)}.png")
-            img.save(png)
+            img.save(png, compress_level=1)
             layers.append(None)
             inputs.extend(["-i", str(png)])
         run.clear()
 
-    for ov in layout["overlays"]:
+    def add_wobble(ov: dict, seed: int) -> None:
+        # one frame per half-step only for an "apart" text (its letters change between
+        # the box's poses); anything else changes once per pose
+        apart = ov["type"] == "text" and ov.get("anim_target") == "apart"
+        steps = range(2 * ANIM_POSES) if apart else range(0, 2 * ANIM_POSES, 2)
+        drawn: dict = {}  # repeated poses share their image
+        poses = []
+        for p in steps:
+            posed = wobble_pose(ov, seed, p)
+            key = (posed.get("_tilt_box"), posed.get("_tilt_text"))
+            if key not in drawn:
+                drawn[key] = render_overlays(layout, values, size, [posed])
+            poses.append(drawn[key])
+        boxes = [b for b in (img.getbbox() for img in drawn.values() if img is not None) if b]
+        if not boxes:
+            return  # e.g. a {title} text on a video without a title
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        pattern = tmp_prefix.with_name(f"{tmp_prefix.name}_{len(layers)}_%02d.png")
+        for p, img in enumerate(poses):  # temp files: fast compression beats small
+            img.crop((x0, y0, x1, y1)).save(str(pattern) % p, compress_level=1)
+        layers.append({"anim": True, "x": x0, "y": y0})
+        inputs.extend(["-loop", "1", "-framerate", str(len(poses) // ANIM_POSES * ANIM_FPS),
+                       "-i", str(pattern)])
+
+    for seed, ov in enumerate(layout["overlays"]):
         if not ov["visible"]:
             continue
         if is_media(ov):
             if Path(ov["path"]).is_file():
                 flush()
-                layers.append(ov)
+                layers.append({**ov, "seed": seed})
                 inputs.extend(["-stream_loop", "-1", "-i", ov["path"]])
+        elif ov.get("animate") and not still:
+            flush()
+            add_wobble(ov, seed)
         else:
-            run.append(ov)
+            run.append(wobble_pose(ov, seed, 0))
     flush()
     return layers, inputs
 
 
-def filter_for_video(layout: dict | None, values: dict, tmp_prefix: Path) -> tuple[str, list[str]]:
+def filter_for_video(layout: dict | None, values: dict, tmp_prefix: Path,
+                     still: bool = False) -> tuple[str, list[str]]:
     """Filter graph for one video (built-in CONFIG when layout is None) + the extra
-    ffmpeg input args its overlays need (PNG files are written next to tmp_prefix)."""
+    ffmpeg input args its overlays need (PNG files are written next to tmp_prefix).
+    still=True for single-frame previews (see overlay_layers)."""
     if layout is None:
         return build_filter_complex(), []
-    layers, inputs = overlay_layers(layout, values, tmp_prefix)
+    layers, inputs = overlay_layers(layout, values, tmp_prefix, still)
     return build_filter_complex_from_layout(layout, layers), inputs
 
 
@@ -659,6 +824,12 @@ def load_layout(path: Path) -> dict:
 
 def save_layout(path: Path, layout: dict) -> None:
     path.write_text(json.dumps(normalize_layout(layout), indent=2) + "\n", encoding="utf-8")
+
+
+def config_file(name: str | Path = DEFAULT_LAYOUT_NAME) -> Path:
+    """Config files live in CONFIGS_DIR; a bare file name resolves there."""
+    p = Path(name)
+    return p if p.parent != Path(".") else Path(CONFIGS_DIR) / p.name
 
 
 def _layout_parts(layout: dict, src: str = "0:v", tag: str = "") -> tuple[list[str], str]:
@@ -719,15 +890,28 @@ def _overlay_parts(layout: dict, prev: str, layers: list, first_input: int = 1) 
     for k, ov in enumerate(layers, start=first_input):
         if ov is None:
             parts.append(f"[{prev}][{k}:v]overlay=x=0:y=0[l{k}]")
+        elif ov.get("anim"):
+            # the poses loop forever: shortest=1 stops them with the gameplay
+            parts.append(f"[{prev}][{k}:v]overlay=x={ov['x']}:y={ov['y']}:shortest=1[l{k}]")
         else:
             r = ov["out"]
             bw, bh = even(width * r["w"]), even(height * r["h"])
             x, y = round(width * r["x"]), round(height * r["y"])
             # rotated: the frame grows to fit the turned picture (transparent corners);
             # the overlay below stays centered on the rectangle either way
-            rad = num(math.radians(ov.get("rotation", 0)))
-            turn = (f"format=rgba,rotate={rad}:ow=rotw({rad}):oh=roth({rad}):c=none,"
-                    if ov.get("rotation") else "")
+            if ov.get("animate"):
+                # step through the same wobble poses as the editor preview
+                angles = [math.radians(ov.get("rotation", 0) + t) for t in wobble_tilts(ov["seed"])]
+                expr = num(angles[-1])
+                for i in range(len(angles) - 2, -1, -1):
+                    expr = f"if(eq(ld(0)\\,{i})\\,{num(angles[i])}\\,{expr})"
+                widest = num(max(angles, key=abs))
+                turn = (f"format=rgba,rotate=a=st(0\\,mod(floor(t*{ANIM_FPS})\\,{len(angles)}))*0+{expr}"
+                        f":ow=rotw({widest}):oh=roth({widest}):c=black@0,")
+            else:
+                rad = num(math.radians(ov.get("rotation", 0)))
+                turn = (f"format=rgba,rotate={rad}:ow=rotw({rad}):oh=roth({rad}):c=black@0,"
+                        if ov.get("rotation") else "")
             parts.append(f"[{k}:v]scale=w={bw}:h={bh}:force_original_aspect_ratio=decrease,"
                          f"{turn}setsar=1[m{k}]")
             # shortest=1: the endlessly looped input stops when the gameplay does
@@ -940,7 +1124,7 @@ def build_preview_cmd(ffmpeg: str, src: Path, dst: Path, fc: str, at: float,
 
 def ensure_dirs() -> None:
     """Create the working folder layout if it is missing (runs on every init)."""
-    for d in (INPUT_DIR, CONVERTED_DIR, OUTPUT_DIR, PUBLISHED_DIR):
+    for d in (CONFIGS_DIR, INPUT_DIR, CONVERTED_DIR, OUTPUT_DIR, PUBLISHED_DIR):
         Path(d).mkdir(parents=True, exist_ok=True)
 
 
@@ -1002,12 +1186,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--config", nargs="?", const=DEFAULT_LAYOUT_NAME, default=None, metavar="FILE",
-        help=f"open the visual layout editor UI on FILE (default: ./{DEFAULT_LAYOUT_NAME})",
+        help=f"open the visual layout editor UI on FILE (default: ./{config_file()})",
     )
     parser.add_argument(
         "--layout", default=None, metavar="FILE",
         help=f"layout file to use when rendering "
-             f"(default: ./{DEFAULT_LAYOUT_NAME} if it exists, else the built-in CONFIG)",
+             f"(default: ./{config_file()} if it exists, else the built-in CONFIG)",
     )
     parser.add_argument(
         "--encoder", choices=["auto", *ENCODERS], default="auto",
@@ -1039,7 +1223,7 @@ def main() -> None:
         for raw in roots:
             if Path(raw).exists():
                 candidates.extend(collect_inputs([raw]))
-        sys.exit(layout_editor.run_editor(Path(args.config), candidates))
+        sys.exit(layout_editor.run_editor(config_file(args.config), candidates))
 
     raw_inputs = args.inputs or [INPUT_DIR]
     if not args.inputs and not Path(INPUT_DIR).exists():
@@ -1054,9 +1238,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "published").mkdir(exist_ok=True)  # drop zone for already-uploaded shorts
 
-    # pick the layout: explicit --layout, else ./layout.json if present,
+    # pick the layout: explicit --layout, else ./configs/layout.json if present,
     # else fall back to the built-in CONFIG block
-    layout_file = Path(args.layout) if args.layout else Path(DEFAULT_LAYOUT_NAME)
+    layout_file = config_file(args.layout or DEFAULT_LAYOUT_NAME)
     if args.layout and not layout_file.exists():
         sys.exit(f"error: layout file not found: {layout_file}")
     layout: dict | None = None

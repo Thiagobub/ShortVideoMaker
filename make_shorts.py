@@ -299,6 +299,14 @@ def normalize_layout(raw: dict) -> dict:
 
 FONT_EXTS = {".ttf", ".otf", ".ttc"}
 ANIMATED_EXTS = {".gif"} | VIDEO_EXTS
+
+# "animate": the stop-motion wobble of Deadlock's ability cards - the item snaps
+# to a new small tilt (on top of its own rotation) a couple of times a second
+ANIM_FPS = 2          # poses per second
+ANIM_DEGREES = 4.0    # largest tilt added, either way
+ANIM_POSES = 8        # poses before the wobble repeats
+# what wobbles on a text: box + text in sync, box + text each on its own, box, text
+ANIM_TARGETS = ("all", "apart", "box", "text")
 HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 
 
@@ -317,6 +325,8 @@ def normalize_overlay(raw: dict, i: int) -> dict:
         "out": {"x": clamp01(r.get("x", 0)), "y": clamp01(r.get("y", 0)), "w": w, "h": h},
         # degrees clockwise around the rectangle's center, kept in -180..180
         "rotation": (float(raw.get("rotation", 0)) + 180) % 360 - 180,
+        "animate": bool(raw.get("animate", False)),
+        "anim_target": raw.get("anim_target") if raw.get("anim_target") in ANIM_TARGETS else "all",
     }
     if kind == "image":
         ov["path"] = str(raw.get("path", ""))
@@ -455,16 +465,18 @@ def _wrap(draw, text: str, font, width: float) -> list[str]:
     return lines
 
 
-def _composite(canvas, layer, ov: dict) -> None:
+def _composite(canvas, layer, ov: dict, tilt: float = 0.0) -> None:
     """Lay one overlay's full-canvas layer on the canvas, turned by its rotation
-    around the center of its rectangle (the content is laid out unrotated first)."""
+    (+ a wobble tilt) around the center of its rectangle (the content is laid out
+    unrotated first)."""
     from PIL import Image
 
-    if ov.get("rotation"):
+    angle = ov.get("rotation", 0) + tilt
+    if angle:
         cw, ch = canvas.size
         r = ov["out"]
         center = ((r["x"] + r["w"] / 2) * cw, (r["y"] + r["h"] / 2) * ch)
-        layer = layer.rotate(-ov["rotation"], resample=Image.BICUBIC, center=center)
+        layer = layer.rotate(-angle, resample=Image.BICUBIC, center=center)
     canvas.alpha_composite(layer)
 
 
@@ -503,8 +515,13 @@ def _draw_text(canvas, ov: dict, values: dict) -> None:
     else:
         x0 = bx + (bw - block_w) / 2
     y0 = by + (bh - block_h) / 2
+    # the box gets a layer of its own when it wobbles apart from the text
+    box_tilt, text_tilt = ov.get("_tilt_box", 0.0), ov.get("_tilt_text", 0.0)
     if ov["bg_enabled"]:
-        draw.rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=ov["bg"])
+        box_layer = layer if box_tilt == text_tilt else Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        ImageDraw.Draw(box_layer).rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=ov["bg"])
+        if box_layer is not layer:
+            _composite(canvas, box_layer, ov, box_tilt)
     inner_w = block_w - 2 * pad
     for i, (line, lw) in enumerate(zip(lines, widths)):
         if ov["align"] == "left":
@@ -515,7 +532,7 @@ def _draw_text(canvas, ov: dict, values: dict) -> None:
             lx = x0 + pad + (inner_w - lw) / 2
         draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=ov["color"],
                   stroke_width=stroke, stroke_fill="#000000")
-    _composite(canvas, layer, ov)
+    _composite(canvas, layer, ov, text_tilt)
 
 
 def is_media(ov: dict) -> bool:
@@ -564,16 +581,50 @@ def _draw_image(canvas, ov: dict) -> None:
     img = img.resize(size, Image.LANCZOS)
     layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     layer.paste(img, (round(r["x"] * cw + (bw - size[0]) / 2), round(r["y"] * ch + (bh - size[1]) / 2)))
-    _composite(canvas, layer, ov)
+    _composite(canvas, layer, ov, ov.get("_tilt_box", 0.0))
 
 
-def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None):
+@functools.lru_cache(maxsize=256)
+def wobble_tilts(seed: int) -> tuple[float, ...]:
+    """The ANIM_POSES tilts of one item (seeded by its place in the list, so every
+    item wobbles on its own); each pose differs clearly from the one before."""
+    import random
+
+    rng = random.Random(seed * 7919 + 17)
+    tilts: list[float] = []
+    while len(tilts) < ANIM_POSES:
+        t = rng.uniform(-ANIM_DEGREES, ANIM_DEGREES)
+        if not tilts or abs(t - tilts[-1]) >= ANIM_DEGREES / 2:
+            tilts.append(t)
+    return tuple(tilts)
+
+
+def wobble_pose(ov: dict, seed: int, step: int) -> dict:
+    """The overlay as drawn at wobble half-step `step` (2 per pose; unchanged when it
+    isn't animated): the tilt goes to the box and/or the text of a text as its
+    anim_target says (an image is all "box"). "apart" gives the text tilts of its
+    own that change half a pose after the box's, so the two never move together."""
+    if not ov.get("animate"):
+        return ov
+    tilt = wobble_tilts(seed)[step // 2 % ANIM_POSES]
+    target = ov.get("anim_target", "all") if ov["type"] == "text" else "all"
+    if target == "apart":
+        text_tilt = wobble_tilts(seed + 1000)[(step + 1) // 2 % ANIM_POSES]
+        return {**ov, "_tilt_box": tilt, "_tilt_text": text_tilt}
+    return {**ov, "_tilt_box": tilt if target in ("all", "box") else 0.0,
+            "_tilt_text": tilt if target in ("all", "text") else 0.0}
+
+
+def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None,
+                    step: int = 0):
     """Overlays on a transparent RGBA image of `size`, or None. By default all the
-    layout's visible ones (GIFs/videos as their first frame, for previews)."""
+    layout's visible ones (GIFs/videos as their first frame, animated ones at wobble
+    half-step `step`, for previews); `items` are drawn exactly as given."""
     if items is None:
         if not layout.get("overlays_enabled"):
             return None
-        items = [ov for ov in layout.get("overlays", []) if ov["visible"]]
+        items = [wobble_pose(ov, i, step) for i, ov in enumerate(layout.get("overlays", []))
+                 if ov["visible"]]
     if not items:
         return None
     try:
@@ -593,7 +644,9 @@ def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, 
     """Split one video's overlays into ffmpeg layers, keeping their stacking order.
 
     Returns (layers, input args): one layer per extra input (1, 2, ...) - None for a
-    full-canvas PNG of consecutive texts/stills, or the GIF/video overlay dict."""
+    full-canvas PNG of consecutive texts/stills, {"anim", "x", "y"} for the looped
+    wobble poses of an animated text/still (cropped PNGs placed at x, y), or the
+    GIF/video overlay dict (plus its "seed" for the wobble)."""
     if not layout.get("overlays_enabled"):
         return [], []
     out = layout["output"]
@@ -611,14 +664,32 @@ def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, 
             inputs.extend(["-i", str(png)])
         run.clear()
 
-    for ov in layout["overlays"]:
+    def add_wobble(ov: dict, seed: int) -> None:
+        # one frame per half-step, so an "apart" text can change between the box's poses
+        poses = [render_overlays(layout, values, size, [wobble_pose(ov, seed, p)])
+                 for p in range(2 * ANIM_POSES)]
+        boxes = [img.getbbox() for img in poses if img is not None and img.getbbox()]
+        if not boxes:
+            return  # e.g. a {title} text on a video without a title
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        pattern = tmp_prefix.with_name(f"{tmp_prefix.name}_{len(layers)}_%02d.png")
+        for p, img in enumerate(poses):
+            img.crop((x0, y0, x1, y1)).save(str(pattern) % p)
+        layers.append({"anim": True, "x": x0, "y": y0})
+        inputs.extend(["-loop", "1", "-framerate", str(2 * ANIM_FPS), "-i", str(pattern)])
+
+    for seed, ov in enumerate(layout["overlays"]):
         if not ov["visible"]:
             continue
         if is_media(ov):
             if Path(ov["path"]).is_file():
                 flush()
-                layers.append(ov)
+                layers.append({**ov, "seed": seed})
                 inputs.extend(["-stream_loop", "-1", "-i", ov["path"]])
+        elif ov.get("animate"):
+            flush()
+            add_wobble(ov, seed)
         else:
             run.append(ov)
     flush()
@@ -719,15 +790,28 @@ def _overlay_parts(layout: dict, prev: str, layers: list, first_input: int = 1) 
     for k, ov in enumerate(layers, start=first_input):
         if ov is None:
             parts.append(f"[{prev}][{k}:v]overlay=x=0:y=0[l{k}]")
+        elif ov.get("anim"):
+            # the poses loop forever: shortest=1 stops them with the gameplay
+            parts.append(f"[{prev}][{k}:v]overlay=x={ov['x']}:y={ov['y']}:shortest=1[l{k}]")
         else:
             r = ov["out"]
             bw, bh = even(width * r["w"]), even(height * r["h"])
             x, y = round(width * r["x"]), round(height * r["y"])
             # rotated: the frame grows to fit the turned picture (transparent corners);
             # the overlay below stays centered on the rectangle either way
-            rad = num(math.radians(ov.get("rotation", 0)))
-            turn = (f"format=rgba,rotate={rad}:ow=rotw({rad}):oh=roth({rad}):c=none,"
-                    if ov.get("rotation") else "")
+            if ov.get("animate"):
+                # step through the same wobble poses as the editor preview
+                angles = [math.radians(ov.get("rotation", 0) + t) for t in wobble_tilts(ov["seed"])]
+                expr = num(angles[-1])
+                for i in range(len(angles) - 2, -1, -1):
+                    expr = f"if(eq(ld(0)\\,{i})\\,{num(angles[i])}\\,{expr})"
+                widest = num(max(angles, key=abs))
+                turn = (f"format=rgba,rotate=a=st(0\\,mod(floor(t*{ANIM_FPS})\\,{len(angles)}))*0+{expr}"
+                        f":ow=rotw({widest}):oh=roth({widest}):c=black@0,")
+            else:
+                rad = num(math.radians(ov.get("rotation", 0)))
+                turn = (f"format=rgba,rotate={rad}:ow=rotw({rad}):oh=roth({rad}):c=black@0,"
+                        if ov.get("rotation") else "")
             parts.append(f"[{k}:v]scale=w={bw}:h={bh}:force_original_aspect_ratio=decrease,"
                          f"{turn}setsar=1[m{k}]")
             # shortest=1: the endlessly looped input stops when the gameplay does

@@ -48,6 +48,14 @@ BOX_COLORS = [
     "#d878ff", "#3fe0dd", "#ff9b3f", "#a6e84f",
 ]
 OVERLAY_COLOR = "#ffffff"  # outline of the text/image rectangles (dashed)
+# "Deadlock style" text: the in-game ability cards (cream text on a brick-red card)
+DEADLOCK_FONT = "fonts/deadlock/valvepulp-bold.ttf"
+DEADLOCK_TEXT, DEADLOCK_CARD = "#F4EBDD", "#A3473D"
+# "animate" dropdown: label -> (animate, anim_target); images only get off / on
+ANIM_TEXT_CHOICES = {"off": (False, "all"), "box + text": (True, "all"),
+                     "box + text (apart)": (True, "apart"),
+                     "box only": (True, "box"), "text only": (True, "text")}
+ANIM_IMAGE_CHOICES = {"off": (False, "all"), "on": (True, "all")}
 IMAGE_TYPES = [
     ("Images, GIFs and videos", "*.png *.jpg *.jpeg *.webp *.bmp *.gif "
      + " ".join(f"*{e}" for e in sorted(ms.VIDEO_EXTS))),
@@ -220,6 +228,8 @@ class LayoutEditor:
             self.load_video(videos[0])
         else:
             self.refresh()
+        self.anim_step = 0  # wobble half-step shown by the live preview
+        self.root.after(500 // ms.ANIM_FPS, self._anim_tick)
 
     # ------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -509,6 +519,10 @@ class LayoutEditor:
                           values=["left", "center", "right"])
         cb.pack(side="left", padx=2)
         cb.bind("<<ComboboxSelected>>", self._on_ov_field)
+        btn = ttk.Button(row3, text="Deadlock style", command=self.deadlock_style)
+        btn.pack(side="left", padx=(10, 0))
+        ToolTip(btn, "Cream text in a brick-red card, Valve Pulp font (from ./fonts/deadlock) "
+                     "- tick 'animate' too for the in-game wobble")
 
         # fields of the selected image
         f = self.ov_image_frame = ttk.Frame(grp)
@@ -536,6 +550,15 @@ class LayoutEditor:
         ToolTip(sb, "Degrees clockwise, around the center of the rectangle")
         ttk.Button(f, text="0°", width=3, command=lambda: self._on_ov_rotation(0)).grid(
             row=0, column=3, padx=(4, 0))
+        self.var_ov_anim = tk.StringVar(value="off")
+        ttk.Label(f, text="animate").grid(row=0, column=4, padx=(8, 2))
+        cb = self.combo_ov_anim = ttk.Combobox(f, textvariable=self.var_ov_anim, width=16,
+                                               state="readonly", values=list(ANIM_TEXT_CHOICES))
+        cb.grid(row=0, column=5)
+        cb.bind("<<ComboboxSelected>>", self._on_ov_field)
+        ToolTip(cb, f"Deadlock-style wobble: snaps to a new small tilt (up to "
+                    f"±{ms.ANIM_DEGREES:g}° around 'rotate') {ms.ANIM_FPS}x a second - "
+                    f"the whole text, only its box or only the letters")
 
         # sample values: only for this preview, each video gets its own in gui.py
         sample = ttk.Frame(grp)
@@ -981,6 +1004,27 @@ class LayoutEditor:
                 ov["bg_enabled"] = True
             self._after_edit()
 
+    def deadlock_style(self) -> None:
+        ov = self.current_overlay()
+        if ov is None or ov["type"] != "text":
+            return
+        if ms.resolve_font(DEADLOCK_FONT):
+            ov["font"] = DEADLOCK_FONT
+        else:
+            self.status.configure(text=f"{DEADLOCK_FONT} not found - kept the current font")
+        ov.update({"color": DEADLOCK_TEXT, "bg": DEADLOCK_CARD, "bg_enabled": True,
+                   "outline": False})
+        self._after_edit()
+
+    def _anim_tick(self) -> None:
+        """Step the wobble of animated texts/images in the live preview."""
+        self.root.after(500 // ms.ANIM_FPS, self._anim_tick)
+        if self.drag is not None or not self.layout["overlays_enabled"]:
+            return
+        if any(ov["visible"] and ov.get("animate") for ov in self.layout["overlays"]):
+            self.anim_step += 1
+            self.draw_right()
+
     def pick_font_file(self) -> None:
         ov = self.current_overlay()
         if ov is None or ov["type"] != "text":
@@ -997,6 +1041,9 @@ class LayoutEditor:
             return
         before = copy.deepcopy(ov)
         ov["visible"] = bool(self.var_ov_visible.get())
+        choices = ANIM_TEXT_CHOICES if ov["type"] == "text" else ANIM_IMAGE_CHOICES
+        if self.var_ov_anim.get() in choices:
+            ov["animate"], ov["anim_target"] = choices[self.var_ov_anim.get()]
         if ov["type"] == "text":
             ov["text"] = self.var_ov_text.get()
             if self.var_ov_font.get() not in self.fonts:  # a group header
@@ -1049,6 +1096,10 @@ class LayoutEditor:
         rotation = ov.get("rotation", 0)
         set_if_changed(self.var_ov_rot, float(rotation))
         set_if_changed(self.var_ov_rot_text, f"{rotation:g}")
+        choices = ANIM_TEXT_CHOICES if kind == "text" else ANIM_IMAGE_CHOICES
+        self.combo_ov_anim.configure(values=list(choices))
+        state = (ov.get("animate", False), ov.get("anim_target", "all") if kind == "text" else "all")
+        set_if_changed(self.var_ov_anim, next(k for k, v in choices.items() if v == state))
         if kind == "image":
             self.lbl_ov_path.configure(text=ov["path"] or "(no file)")
             return
@@ -1295,7 +1346,8 @@ class LayoutEditor:
             canvas.paste(crop, (round(o["x"] * pw), round(o["y"] * ph)))
 
         # texts/images: the very same drawing code the real render uses
-        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph))
+        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph),
+                                      step=getattr(self, "anim_step", 0))
         if overlays is not None:
             canvas.paste(overlays, (0, 0), overlays)
         return canvas

@@ -145,7 +145,7 @@ so you can verify a layout on paper before encoding whole videos.
 | **Selected box** | Exact `x y w h` fractions for the source crop and the output placement, plus `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`). |
 | **Background & output** | Blurred-background on/off, zoom, blur, output canvas size, CRF, x264 preset. |
 | **Render exact frame** | Renders the current frame through the **real** ffmpeg filter graph (~1 s) and shows it next to the command — the live preview approximates the blur, this is pixel-exact. |
-| **Texts & images** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image` add more; drag their dashed rectangles on the preview. Pick a font from the dropdown: the ones you drop in `./fonts` come first, one block per subfolder (e.g. `./fonts/deadlock/` shows as *deadlock › radiance-bold*), then the installed Windows fonts; `…` picks any other `.ttf`/`.otf` file. Then size, text color, box color, outline, alignment and rotation (*rotate°*: slider, exact degrees, or `0°` to reset; texts and images alike). `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
+| **Texts & images** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image` add more; drag their dashed rectangles on the preview. Pick a font from the dropdown: the ones you drop in `./fonts` come first, one block per subfolder (e.g. `./fonts/deadlock/` shows as *deadlock › radiance-bold*), then the installed Windows fonts; `…` picks any other `.ttf`/`.otf` file. Then size, text color, box color, outline, alignment and rotation (*rotate°*: slider, exact degrees, or `0°` to reset; texts and images alike) and *animate*: the stop-motion wobble of Deadlock's ability cards, a new small tilt twice a second (the preview plays it live) - on a text, pick whether the box and text wobble together (*box + text*), each on its own (*box + text (apart)*: different tilts, the letters changing between the box's moves), or only the box, or only the letters. *Deadlock style* turns a text into one of those cards: cream text on a brick-red box in Valve Pulp (from `./fonts/deadlock/`). `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
 | **Save layout** | Writes the JSON. It is used automatically next time you render (or pass `--layout`). |
 
 Interactions: drag inside a box to move it, drag its corner/edge handles to resize,
@@ -185,7 +185,7 @@ built-in `CONFIG` numbers, scaled to the first video you load.
   "overlays": [
     { "type": "text", "visible": true, "text": "CREDIT: {credit}", "font": "impact.ttf",
       "size": 0.03, "color": "#000000", "bg_enabled": true, "bg": "#FFFFFF",
-      "outline": false, "align": "center", "rotation": 0,
+      "outline": false, "align": "center", "rotation": 0, "animate": false, "anim_target": "all",
       "out": { "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.06 } },
     { "type": "image", "visible": true, "path": "logo.png", "rotation": -8,
       "out": { "x": 0.6, "y": 0.82, "w": 0.35, "h": 0.1 } }
@@ -197,6 +197,14 @@ built-in `CONFIG` numbers, scaled to the first video you load.
   whose variable is empty for a video is skipped. An image is fitted inside its rectangle.
   `rotation` (degrees clockwise, -180..180, default 0) turns the finished text or image
   around the center of its rectangle, so a turned item can poke out of the rectangle.
+  `animate: true` adds the wobble: every `1/ANIM_FPS` s (0.5 s) the item snaps to another
+  tilt of up to ±`ANIM_DEGREES` (4°) around its `rotation`, cycling through `ANIM_POSES` (8)
+  poses; each item wobbles on its own. On a text, `anim_target` picks what wobbles:
+  `"all"` (box and text together), `"apart"` (each with its own tilts, the text changing
+  half a pose after the box), `"box"` (the letters stay level) or `"text"` (the box stays
+  put). Texts and still images are pre-drawn in every pose
+  and looped by ffmpeg, GIFs/videos are turned by ffmpeg's `rotate` with the same angles,
+  so the render matches the editor preview.
   Texts and still images are drawn with Pillow into transparent PNGs laid over the video,
   so rendering a layout with overlays needs Pillow too.
 - An `image` whose `path` is a **GIF or a video** is animated: ffmpeg loops it

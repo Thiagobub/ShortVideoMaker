@@ -20,7 +20,7 @@ Turns already-cropped Steam gameplay videos into **YouTube Shorts** (9:16) with 
 +---------------------------+
 ```
 
-Layouts are driven by a **layout file** (`layout.json`): a list of named boxes, each with
+Layouts are driven by a **layout file** (`configs/layout.json`): a list of named boxes, each with
 a *source* rectangle (what gets cropped from the video) and an *output* rectangle (where it
 is placed on the 9:16 canvas). Tune them **visually** with the built-in editor:
 
@@ -53,7 +53,7 @@ Rendering itself needs nothing but Python and ffmpeg.
 ## Usage
 
 ```bash
-python make_shorts.py --config               # open the layout editor (./layout.json)
+python make_shorts.py --config               # open the layout editor (./configs/layout.json)
 python make_shorts.py --config my.json       # open the editor on a specific layout file
 python make_shorts.py                        # every video in ./input
 python make_shorts.py clip.mp4               # one file
@@ -89,19 +89,20 @@ python gui.py      # or: pythonw gui.py (no console window on Windows)
 
 A small window over the same pipeline: lists the videos in `./input` (add more with
 *Adicionar…*), renders with per-video and overall progress, can cancel (half-written
-outputs are deleted), renders a single test frame per layout (*Prévia*), opens the layout
+outputs are deleted), shows a single test frame per layout in a popup window (*Prévia*,
+with a *Salvar como .png* button when you want to keep it), opens the layout
 editor (*Editar layout ▾*, which also creates new layouts) and the output folder.
 
-*Saídas* has a checkbox per saved layout (`*.json` in the project folder): every ticked one
+*Saídas* is a dropdown listing the saved layouts (`*.json` in `configs/`): every ticked one
 is rendered as its own file, `<video>_<layout>.mp4` (e.g. `clip_youtube.mp4` and
 `clip_tiktok.mp4`). They come out of a single ffmpeg run per video, which decodes the
 gameplay once and encodes the outputs side by side (up to 4 per run), so two layouts take
 noticeably less than twice the time of one. If that combined run fails, the layouts are
-retried one at a time, then on the CPU. The ticks are remembered in `input/gui_settings.json`.
+retried one at a time, then on the CPU. The ticks are remembered in `configs/gui_settings.json`.
 
 The *Título* / *Crédito* / *Trecho* columns hold each video's `{title}`, `{credit}` and an
 optional start/end (`83` or `1:23`; blank = whole video). Double-click a row to edit them;
-they are saved to `input/titles.json` and the trim applies to every render of that video.
+they are saved to `configs/titles.json` and the trim applies to every render of that video.
 
 *Juntar selecionados* puts the selected videos one after the other in a single short, in
 list order (move rows with ↑ ↓), each cut to its own trim: `<first video>_juntado_<layout>.mp4`
@@ -112,8 +113,8 @@ they stay in place across the cut and GIFs keep looping.
 
 The *Aceleração* dropdown shows the
 encoders detected on this machine (`Auto → …` names the one it picked) and lets you
-choose another; GPU failures fall back to the CPU the same way. With no rows selected, *Renderizar*
-processes every row that isn't done yet; with a selection, only those.
+choose another; GPU failures fall back to the CPU the same way. *Renderizar todos*
+processes every row in the list; *Renderizar selecionado(s)* only the selected ones.
 
 ## Folders
 
@@ -121,13 +122,14 @@ The working folders are created automatically every time the script starts:
 
 | Folder | Purpose |
 |---|---|
+| `configs/` | Layouts + GUI settings + per-video titles (personal, gitignored) |
 | `input/` | Drop the raw videos here (default input when no paths are given) |
 | `input/converted/` | Originals are moved here after their short renders successfully |
 | `output/` | Rendered shorts land here as `<name>_short.mp4` |
 | `output/published/` | Manually move shorts here once they have been uploaded |
 
 When rendering, the layout source is picked in this order: `--layout FILE`, then
-`./layout.json` if it exists, then the built-in `CONFIG` block. The command prints which
+`./configs/layout.json` if it exists, then the built-in `CONFIG` block. The command prints which
 one it used.
 
 **Tip:** `--preview <seconds>` writes a single PNG of the composed frame in about a second,
@@ -140,20 +142,20 @@ so you can verify a layout on paper before encoding whole videos.
 | **Left panel** | The video paused at the scrubber position. Each box outline is a region cropped **from** the source. |
 | **Right panel** | Live preview of the composed 9:16 output (recomposited instantly as you edit). Each box outline is where that crop is **placed** on the canvas. |
 | **Time bar** | Scrub to any frame (`‹ 1 frame` / `1 frame ›` steps by a single frame) to check the layout against different moments. |
-| **Boxes** | `Add`, `Remove`, `Rename`, `↑`/`↓` reorder (later in the list draws on top). |
+| **Elements** | The crop boxes and the texts/images in **one** list (top of the list = bottom of the stack; texts/images carry a `T` / `▶` icon and always draw on top of every box). `Add box`, `+ Text`, `+ Image/GIF`, `Remove`, `Rename`, `↑`/`↓` reorder (later in the list draws on top) and `⇔ center`. |
 | **Undo / Redo** | Step backwards/forwards through every change. Buttons in the top bar (hover them for a hint) or `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z` also works). One drag or one slider scrub = one step. |
-| **Selected box** | Exact `x y w h` fractions for the source crop and the output placement, plus `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`). |
+| **Selected item** | The fields of whatever is selected: a box shows its name, `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`); a text or image shows the fields below. |
 | **Background & output** | Blurred-background on/off, zoom, blur, output canvas size, CRF, x264 preset. |
 | **Render exact frame** | Renders the current frame through the **real** ffmpeg filter graph (~1 s) and shows it next to the command — the live preview approximates the blur, this is pixel-exact. |
-| **Texts & images** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image` add more; drag their dashed rectangles on the preview. Pick a font from the dropdown: the ones you drop in `./fonts` come first, one block per subfolder (e.g. `./fonts/deadlock/` shows as *deadlock › radiance-bold*), then the installed Windows fonts; `…` picks any other `.ttf`/`.otf` file. Then size, text color, box color, outline, alignment and rotation (*rotate°*: slider, exact degrees, or `0°` to reset; texts and images alike) and *animate*: the stop-motion wobble of Deadlock's ability cards, a new small tilt twice a second (the preview plays it live) - on a text, pick whether the box and text wobble together (*box + text*), each on its own (*box + text (apart)*: different tilts, the letters changing between the box's moves), or only the box, or only the letters. *Deadlock style* turns a text into one of those cards: cream text on a brick-red box in Valve Pulp (from `./fonts/deadlock/`). `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
+| **Text / image fields** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image/GIF` (in *Elements*) add more; drag their dashed rectangles on the preview. Pick a font from the dropdown: the ones you drop in `./fonts` come first, one block per subfolder (e.g. `./fonts/deadlock/` shows as *deadlock › radiance-bold*), then the installed Windows fonts; `…` picks any other `.ttf`/`.otf` file. Then size, text color, box color, outline, alignment and rotation (*rotate°*: slider, exact degrees, or `0°` to reset; texts and images alike) and *animate*: the rocking wobble of Deadlock's ability cards, a smooth top → middle → bottom → middle cycle twice a second (the preview plays it live) - on a text, pick whether the box and text wobble together (*box + text*), each on its own (*box + text (apart)*: different tilts, the letters changing between the box's moves), or only the box, or only the letters. *Deadlock style* turns a text into one of those cards: cream text on a brick-red box in Valve Pulp (from `./fonts/deadlock/`). `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
 | **Save layout** | Writes the JSON. It is used automatically next time you render (or pass `--layout`). |
 
 Interactions: drag inside a box to move it, drag its corner/edge handles to resize,
-`Delete` removes the selected box, `Ctrl+S` saves, `Ctrl+Z` undoes the last change,
+`Delete` removes the selected element, `Ctrl+S` saves, `Ctrl+Z` undoes the last change,
 `Ctrl+Y` (or `Ctrl+Shift+Z`) redoes it. A fresh editor starts from the
 built-in `CONFIG` numbers, scaled to the first video you load.
 
-## layout.json reference
+## Layout file reference
 
 ```json
 {
@@ -193,15 +195,16 @@ built-in `CONFIG` numbers, scaled to the first video you load.
   ```
 
   A text wraps to its rectangle's width and shrinks (from `size`, a fraction of the output
-  height) until it fits; `{title}` / `{credit}` come from `input/titles.json`, and a text
+  height) until it fits; `{title}` / `{credit}` come from `configs/titles.json`, and a text
   whose variable is empty for a video is skipped. An image is fitted inside its rectangle.
   `rotation` (degrees clockwise, -180..180, default 0) turns the finished text or image
   around the center of its rectangle, so a turned item can poke out of the rectangle.
-  `animate: true` adds the wobble: every `1/ANIM_FPS` s (0.5 s) the item snaps to another
-  tilt of up to ±`ANIM_DEGREES` (4°) around its `rotation`, cycling through `ANIM_POSES` (8)
-  poses; each item wobbles on its own. On a text, `anim_target` picks what wobbles:
-  `"all"` (box and text together), `"apart"` (each with its own tilts, the text changing
-  half a pose after the box), `"box"` (the letters stay level) or `"text"` (the box stays
+  `animate: true` adds the wobble: every `1/ANIM_FPS` s (0.5 s) the item rocks one step of a
+  smooth see-saw (top → middle → bottom → middle, tilts of up to ±`ANIM_DEGREES` (4°) around
+  its `rotation`) that loops without ever jumping back to its start; each item starts at its
+  own point of the cycle. On a text, `anim_target` picks what wobbles:
+  `"all"` (box and text together), `"apart"` (each on its own, the text changing
+  half a step after the box), `"box"` (the letters stay level) or `"text"` (the box stays
   put). Texts and still images are pre-drawn in every pose
   and looped by ffmpeg, GIFs/videos are turned by ffmpeg's `rotate` with the same angles,
   so the render matches the editor preview.

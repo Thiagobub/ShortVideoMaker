@@ -83,6 +83,7 @@ CONVERTED_DIR = "input/converted"  # originals are moved here after a successful
 OUTPUT_DIR = "output"              # default output folder
 PUBLISHED_DIR = "output/published"  # move finished shorts here after uploading them
 
+CONFIGS_DIR = "configs"              # layouts + per-machine settings (gitignored)
 DEFAULT_LAYOUT_NAME = "layout.json"  # written by --config, read when rendering
 
 # ---- ENCODERS: GPU acceleration, with the CPU (x264) as the fallback ---
@@ -95,7 +96,7 @@ ENCODERS = {  # key -> label shown to the user
 GPU_ORDER = ("nvidia", "amd", "intel")  # "auto" picks the first one that works
 
 # ---- OVERLAYS: texts/images drawn on top of the short ----------------
-TITLES_FILE = "input/titles.json"  # per-video {title}/{credit} values, typed in gui.py
+TITLES_FILE = str(Path(CONFIGS_DIR) / "titles.json")  # per-video {title}/{credit} values, typed in gui.py
 FONTS_DIR = "fonts"                # optional extra .ttf/.otf files for the overlays
 DEFAULT_FONT = "impact.ttf"        # ships with Windows
 # ======================================================================
@@ -300,11 +301,12 @@ def normalize_layout(raw: dict) -> dict:
 FONT_EXTS = {".ttf", ".otf", ".ttc"}
 ANIMATED_EXTS = {".gif"} | VIDEO_EXTS
 
-# "animate": the stop-motion wobble of Deadlock's ability cards - the item snaps
-# to a new small tilt (on top of its own rotation) a couple of times a second
-ANIM_FPS = 2          # poses per second
+# "animate": the rocking wobble of Deadlock's ability cards - the item tilts
+# smoothly through top -> middle -> bottom -> middle and repeats (the cycle
+# never jumps back to its start), one step every 1/ANIM_FPS s
+ANIM_FPS = 2          # wobble steps per second
 ANIM_DEGREES = 4.0    # largest tilt added, either way
-ANIM_POSES = 8        # poses before the wobble repeats
+ANIM_POSES = 4        # steps of one see-saw: top, middle, bottom, middle
 # what wobbles on a text: box + text in sync, box + text each on its own, box, text
 ANIM_TARGETS = ("all", "apart", "box", "text")
 HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
@@ -586,17 +588,12 @@ def _draw_image(canvas, ov: dict) -> None:
 
 @functools.lru_cache(maxsize=256)
 def wobble_tilts(seed: int) -> tuple[float, ...]:
-    """The ANIM_POSES tilts of one item (seeded by its place in the list, so every
-    item wobbles on its own); each pose differs clearly from the one before."""
-    import random
-
-    rng = random.Random(seed * 7919 + 17)
-    tilts: list[float] = []
-    while len(tilts) < ANIM_POSES:
-        t = rng.uniform(-ANIM_DEGREES, ANIM_DEGREES)
-        if not tilts or abs(t - tilts[-1]) >= ANIM_DEGREES / 2:
-            tilts.append(t)
-    return tuple(tilts)
+    """The ANIM_POSES tilts of one item: a smooth see-saw (top, middle, bottom,
+    middle, then repeat) so the loop never jumps back to its start; each item
+    starts at its own point of the cycle (seeded by its place in the list, so
+    every item wobbles on its own)."""
+    wave = (ANIM_DEGREES, 0.0, -ANIM_DEGREES, 0.0)  # top, middle, bottom, middle (== ANIM_POSES)
+    return tuple(wave[(k + seed) % ANIM_POSES] for k in range(ANIM_POSES))
 
 
 def wobble_pose(ov: dict, seed: int, step: int) -> dict:
@@ -609,7 +606,9 @@ def wobble_pose(ov: dict, seed: int, step: int) -> dict:
     tilt = wobble_tilts(seed)[step // 2 % ANIM_POSES]
     target = ov.get("anim_target", "all") if ov["type"] == "text" else "all"
     if target == "apart":
-        text_tilt = wobble_tilts(seed + 1000)[(step + 1) // 2 % ANIM_POSES]
+        # one step of the see-saw ahead + half a pose late: the letters change
+        # between the box's moves, so the two never move together
+        text_tilt = wobble_tilts(seed + 1)[(step + 1) // 2 % ANIM_POSES]
         return {**ov, "_tilt_box": tilt, "_tilt_text": text_tilt}
     return {**ov, "_tilt_box": tilt if target in ("all", "box") else 0.0,
             "_tilt_text": tilt if target in ("all", "text") else 0.0}
@@ -730,6 +729,12 @@ def load_layout(path: Path) -> dict:
 
 def save_layout(path: Path, layout: dict) -> None:
     path.write_text(json.dumps(normalize_layout(layout), indent=2) + "\n", encoding="utf-8")
+
+
+def config_file(name: str | Path = DEFAULT_LAYOUT_NAME) -> Path:
+    """Config files live in CONFIGS_DIR; a bare file name resolves there."""
+    p = Path(name)
+    return p if p.parent != Path(".") else Path(CONFIGS_DIR) / p.name
 
 
 def _layout_parts(layout: dict, src: str = "0:v", tag: str = "") -> tuple[list[str], str]:
@@ -1024,7 +1029,7 @@ def build_preview_cmd(ffmpeg: str, src: Path, dst: Path, fc: str, at: float,
 
 def ensure_dirs() -> None:
     """Create the working folder layout if it is missing (runs on every init)."""
-    for d in (INPUT_DIR, CONVERTED_DIR, OUTPUT_DIR, PUBLISHED_DIR):
+    for d in (CONFIGS_DIR, INPUT_DIR, CONVERTED_DIR, OUTPUT_DIR, PUBLISHED_DIR):
         Path(d).mkdir(parents=True, exist_ok=True)
 
 
@@ -1086,12 +1091,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--config", nargs="?", const=DEFAULT_LAYOUT_NAME, default=None, metavar="FILE",
-        help=f"open the visual layout editor UI on FILE (default: ./{DEFAULT_LAYOUT_NAME})",
+        help=f"open the visual layout editor UI on FILE (default: ./{config_file()})",
     )
     parser.add_argument(
         "--layout", default=None, metavar="FILE",
         help=f"layout file to use when rendering "
-             f"(default: ./{DEFAULT_LAYOUT_NAME} if it exists, else the built-in CONFIG)",
+             f"(default: ./{config_file()} if it exists, else the built-in CONFIG)",
     )
     parser.add_argument(
         "--encoder", choices=["auto", *ENCODERS], default="auto",
@@ -1123,7 +1128,7 @@ def main() -> None:
         for raw in roots:
             if Path(raw).exists():
                 candidates.extend(collect_inputs([raw]))
-        sys.exit(layout_editor.run_editor(Path(args.config), candidates))
+        sys.exit(layout_editor.run_editor(config_file(args.config), candidates))
 
     raw_inputs = args.inputs or [INPUT_DIR]
     if not args.inputs and not Path(INPUT_DIR).exists():
@@ -1138,9 +1143,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "published").mkdir(exist_ok=True)  # drop zone for already-uploaded shorts
 
-    # pick the layout: explicit --layout, else ./layout.json if present,
+    # pick the layout: explicit --layout, else ./configs/layout.json if present,
     # else fall back to the built-in CONFIG block
-    layout_file = Path(args.layout) if args.layout else Path(DEFAULT_LAYOUT_NAME)
+    layout_file = config_file(args.layout or DEFAULT_LAYOUT_NAME)
     if args.layout and not layout_file.exists():
         sys.exit(f"error: layout file not found: {layout_file}")
     layout: dict | None = None

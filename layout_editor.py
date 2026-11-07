@@ -217,6 +217,7 @@ class LayoutEditor:
         self.right_map = (0, 0, 0, 0)
         self._left_cache: tuple | None = None   # (frame, w, h, photo)
         self._bg_cache: tuple | None = None     # (frame, w, h, zoom, blur, image)
+        self._base_cache: tuple | None = None   # (frame, key, preview without texts)
         self._resize_job = None
 
         self._build_ui()
@@ -630,7 +631,7 @@ class LayoutEditor:
         self.time = min(self.time, self.duration)
         self.lbl_duration.configure(text=f"/ {fmt_time(self.duration)}   "
                                          f"(drag the slider, release to load the frame)")
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         texts = ms.load_titles().get(path.name)  # preview with this video's own title, if typed
         if texts:
             self.var_sample_title.set(texts.get("title", ""))
@@ -683,7 +684,7 @@ class LayoutEditor:
         self.frame = frame
         self.src_w, self.src_h = frame.size
         self._left_cache = None
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self.refresh()
 
     # ----------------------------------------------------- box fields
@@ -701,7 +702,7 @@ class LayoutEditor:
         self.layout["background"]["blur"] = max(0.0, float(self.var_bg_blur.get()))
         self.lbl_zoom.configure(text=f"zoom {self.layout['background']['zoom']:.2f}")
         self.lbl_blur.configure(text=f"blur {self.layout['background']['blur']:.0f}")
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self._after_edit()
 
     def apply_fields(self) -> None:
@@ -795,7 +796,7 @@ class LayoutEditor:
     def _apply_state(self, state: dict) -> None:
         self.layout = ms.normalize_layout(copy.deepcopy(state))
         self._snap = copy.deepcopy(self.layout)
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self.selected = min(self.selected, len(self.layout["boxes"]) - 1)
         self.ov_selected = min(self.ov_selected, len(self.layout["overlays"]) - 1)
         self.mark_dirty()
@@ -1306,6 +1307,23 @@ class LayoutEditor:
         width, height = out["width"], out["height"]
         k = PREVIEW_H / height
         pw, ph = max(2, round(width * k)), max(2, round(height * k))
+        # background + boxes only change with the frame or the layout's boxes: the
+        # wobble redraws several times a second, so reuse them and redo just the texts
+        key = (pw, ph, repr(self.layout["background"]), repr(self.layout["boxes"]))
+        base = self._base_cache
+        if base is None or base[0] is not self.frame or base[1] != key:
+            self._base_cache = base = (self.frame, key, self._compose_base(pw, ph, k))
+        canvas = base[2].copy()
+
+        # texts/images: the very same drawing code the real render uses
+        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph),
+                                      step=getattr(self, "anim_step", 0))
+        if overlays is not None:
+            canvas.paste(overlays, (0, 0), overlays)
+        return canvas
+
+    def _compose_base(self, pw: int, ph: int, k: float) -> Image.Image:
+        """The preview without the texts/images: blurred background + boxes."""
         canvas = Image.new("RGB", (pw, ph), (0, 0, 0))
         if self.frame is None:
             return canvas
@@ -1344,12 +1362,6 @@ class LayoutEditor:
                 dh = max(2, round(o["h"] * ph))
             crop = crop.resize((dw, dh), Image.BILINEAR)
             canvas.paste(crop, (round(o["x"] * pw), round(o["y"] * ph)))
-
-        # texts/images: the very same drawing code the real render uses
-        overlays = ms.render_overlays(self.layout, self.sample_values(), (pw, ph),
-                                      step=getattr(self, "anim_step", 0))
-        if overlays is not None:
-            canvas.paste(overlays, (0, 0), overlays)
         return canvas
 
     def draw_right(self) -> None:
@@ -1434,7 +1446,8 @@ class LayoutEditor:
         tmp = Path(tempfile.mkdtemp(prefix="ytshort_exact_"))
         dst = tmp / "exact.png"
         try:
-            fc, extra = ms.filter_for_video(self.layout, self.sample_values(), tmp / "overlay")
+            fc, extra = ms.filter_for_video(self.layout, self.sample_values(), tmp / "overlay",
+                                            still=True)
         except RuntimeError as exc:
             messagebox.showerror("Texts / images", str(exc))
             return
@@ -1506,7 +1519,7 @@ class LayoutEditor:
         self.layout_path = Path(path)
         self.selected = self.ov_selected = -1
         self.dirty = False
-        self._bg_cache = None
+        self._bg_cache = self._base_cache = None
         self._history_reset()
         self._update_title()
         self.refresh()

@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 # ============================== CONFIG =================================
@@ -465,39 +466,19 @@ def _wrap(draw, text: str, font, width: float) -> list[str]:
     return lines
 
 
-def _composite(canvas, layer, ov: dict, tilt: float = 0.0) -> None:
-    """Lay one overlay's full-canvas layer on the canvas, turned by its rotation
-    (+ a wobble tilt) around the center of its rectangle (the content is laid out
-    unrotated first)."""
-    from PIL import Image
-
-    angle = ov.get("rotation", 0) + tilt
-    if angle:
-        cw, ch = canvas.size
-        r = ov["out"]
-        center = ((r["x"] + r["w"] / 2) * cw, (r["y"] + r["h"] / 2) * ch)
-        layer = layer.rotate(-angle, resample=Image.BICUBIC, center=center)
-    canvas.alpha_composite(layer)
-
-
-def _draw_text(canvas, ov: dict, values: dict) -> None:
+@functools.lru_cache(maxsize=256)
+def _fit_text(text: str, font_name: str, size: int, bw: float, bh: float, bg_enabled: bool,
+              outline: bool) -> tuple:
+    """Largest size <= `size` whose wrapped text fits a bw x bh rectangle:
+    (font, pad, stroke, lines, widths, line height, block w, block h). Cached: the
+    editor redraws the same texts several times a second while they wobble."""
     from PIL import Image, ImageDraw
 
-    text = fill_text(ov["text"], values)
-    if text is None:
-        return
-    cw, ch = canvas.size
-    r = ov["out"]
-    bx, by, bw, bh = r["x"] * cw, r["y"] * ch, r["w"] * cw, r["h"] * ch
-    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-
-    # largest size <= the requested one whose wrapped text fits the rectangle
-    size = max(4, round(ov["size"] * ch))
+    draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     while True:
-        font = load_font(ov["font"], size)
-        pad = round(size * 0.3) if ov["bg_enabled"] else 0
-        stroke = max(1, round(size * 0.08)) if ov["outline"] else 0
+        font = load_font(font_name, size)
+        pad = round(size * 0.3) if bg_enabled else 0
+        stroke = max(1, round(size * 0.08)) if outline else 0
         lines = _wrap(draw, text, font, bw - 2 * pad)
         ascent, descent = font.getmetrics()
         line_h = ascent + descent
@@ -505,34 +486,134 @@ def _draw_text(canvas, ov: dict, values: dict) -> None:
         block_w = max(widths) + 2 * pad
         block_h = line_h * len(lines) + 2 * pad
         if (block_w <= bw and block_h <= bh) or size <= 4:
-            break
+            return font, pad, stroke, lines, widths, line_h, block_w, block_h
         size = max(4, int(size * 0.92))
 
-    if ov["align"] == "left":
+
+# Overlay pieces are drawn only as big as what they show and cached, and every
+# turn of a piece is cached too: a wobbling item repeats the same few poses (and
+# its other part often doesn't move at all), so each pose is drawn and turned
+# once instead of on every frame of the editor preview / every pose of a render.
+@functools.lru_cache(maxsize=64)
+def _text_pieces(text: str, font_name: str, size: int, color: str, bg_enabled: bool, bg: str,
+                 outline: bool, align: str, rect: tuple[float, float, float, float]) -> tuple:
+    """(box, letters, both, origin) of a text laid out in rect = (x, y, w, h) canvas
+    pixels: images just as big as the drawn block (+ a margin for glyph overhangs),
+    all with their top-left corner at `origin` on the canvas. box is None without
+    a background; both = the letters on the box."""
+    from PIL import Image, ImageDraw
+
+    bx, by, bw, bh = rect
+    font, pad, stroke, lines, widths, line_h, block_w, block_h = _fit_text(
+        text, font_name, size, bw, bh, bg_enabled, outline)
+    if align == "left":
         x0 = bx
-    elif ov["align"] == "right":
+    elif align == "right":
         x0 = bx + bw - block_w
     else:
         x0 = bx + (bw - block_w) / 2
     y0 = by + (bh - block_h) / 2
-    # the box gets a layer of its own when it wobbles apart from the text
-    box_tilt, text_tilt = ov.get("_tilt_box", 0.0), ov.get("_tilt_text", 0.0)
-    if ov["bg_enabled"]:
-        box_layer = layer if box_tilt == text_tilt else Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        ImageDraw.Draw(box_layer).rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=ov["bg"])
-        if box_layer is not layer:
-            _composite(canvas, box_layer, ov, box_tilt)
+    margin = max(4, size // 3)
+    ox, oy = math.floor(x0) - margin, math.floor(y0) - margin
+    w, h = math.ceil(x0 + block_w) + margin - ox, math.ceil(y0 + block_h) + margin - oy
+    x0, y0 = x0 - ox, y0 - oy  # from here on, in the pieces' coordinates
+
+    box = None
+    if bg_enabled:
+        box = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ImageDraw.Draw(box).rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=bg)
+    letters = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(letters)
     inner_w = block_w - 2 * pad
     for i, (line, lw) in enumerate(zip(lines, widths)):
-        if ov["align"] == "left":
+        if align == "left":
             lx = x0 + pad
-        elif ov["align"] == "right":
+        elif align == "right":
             lx = x0 + pad + inner_w - lw
         else:
             lx = x0 + pad + (inner_w - lw) / 2
-        draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=ov["color"],
+        draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=color,
                   stroke_width=stroke, stroke_fill="#000000")
-    _composite(canvas, layer, ov, text_tilt)
+    both = letters if box is None else Image.alpha_composite(box, letters)
+    return box, letters, both, (ox, oy)
+
+
+@functools.lru_cache(maxsize=32)
+def _image_piece(path: str, mtime: float, rect: tuple[float, float, float, float]) -> tuple:
+    """(picture fitted inside rect keeping its aspect, origin) - a video/GIF shows
+    its first frame - or (None, None) when the file can't be read."""
+    from PIL import Image
+
+    try:
+        if Path(path).suffix.lower() in VIDEO_EXTS:
+            img = _media_still(path, mtime)
+            if img is None:
+                return None, None
+        else:
+            img = Image.open(path).convert("RGBA")
+    except (OSError, ValueError):
+        return None, None
+    bx, by, bw, bh = rect
+    scale = min(bw / img.width, bh / img.height)
+    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+    return img.resize(size, Image.LANCZOS), (round(bx + (bw - size[0]) / 2), round(by + (bh - size[1]) / 2))
+
+
+@functools.lru_cache(maxsize=96)
+def _turned(maker, args: tuple, part: int, angle: float):
+    """Piece `part` of maker(*args), turned `angle` degrees clockwise about its own
+    center (grown to fit)."""
+    from PIL import Image
+
+    return maker(*args)[part].rotate(-angle, resample=Image.BICUBIC, expand=True)
+
+
+def _composite(canvas, maker, args: tuple, part: int, pivot: tuple[float, float],
+               angle: float) -> None:
+    """Lay piece `part` of maker(*args) (an image + its canvas origin, see
+    _text_pieces) on the canvas, turned `angle` degrees clockwise about `pivot` -
+    the center of the overlay's rectangle."""
+    pieces = maker(*args)
+    img = pieces[part]
+    if img is None:
+        return
+    ox, oy = pieces[-1]
+    if angle:
+        w, h = img.size
+        img = _turned(maker, args, part, angle)
+        # the piece's center swings around the pivot (y points down: clockwise)
+        a = math.radians(angle)
+        cx, cy = ox + w / 2 - pivot[0], oy + h / 2 - pivot[1]
+        ox = round(pivot[0] + cx * math.cos(a) - cy * math.sin(a) - img.width / 2)
+        oy = round(pivot[1] + cx * math.sin(a) + cy * math.cos(a) - img.height / 2)
+    # alpha_composite takes no negative destination: cut off what is left of / above the canvas
+    sx, sy = max(0, -ox), max(0, -oy)
+    if sx < img.width and sy < img.height:
+        canvas.alpha_composite(img, dest=(ox + sx, oy + sy), source=(sx, sy))
+
+
+def _rect_px(canvas, ov: dict) -> tuple[float, float, float, float]:
+    cw, ch = canvas.size
+    r = ov["out"]
+    return r["x"] * cw, r["y"] * ch, r["w"] * cw, r["h"] * ch
+
+
+def _draw_text(canvas, ov: dict, values: dict) -> None:
+    text = fill_text(ov["text"], values)
+    if text is None:
+        return
+    rect = _rect_px(canvas, ov)
+    pivot = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+    args = (text, ov["font"], max(4, round(ov["size"] * canvas.size[1])), ov["color"],
+            ov["bg_enabled"], ov["bg"], ov["outline"], ov["align"], rect)
+    rotation = ov.get("rotation", 0)
+    box_tilt, text_tilt = ov.get("_tilt_box", 0.0), ov.get("_tilt_text", 0.0)
+    if ov["bg_enabled"] and box_tilt != text_tilt:  # the box wobbles apart from the letters
+        _composite(canvas, _text_pieces, args, 0, pivot, rotation + box_tilt)
+        _composite(canvas, _text_pieces, args, 1, pivot, rotation + text_tilt)
+    else:
+        tilt = box_tilt if ov["bg_enabled"] else text_tilt
+        _composite(canvas, _text_pieces, args, 2, pivot, rotation + tilt)
 
 
 def is_media(ov: dict) -> bool:
@@ -561,27 +642,15 @@ def _media_still(path: str, mtime: float):
 
 
 def _draw_image(canvas, ov: dict) -> None:
-    from PIL import Image
-
     path = Path(ov["path"])
     try:
-        if path.suffix.lower() in VIDEO_EXTS:
-            img = _media_still(str(path), path.stat().st_mtime)
-            if img is None:
-                return
-        else:
-            img = Image.open(path).convert("RGBA")  # a GIF shows its first frame
-    except (OSError, ValueError):
+        mtime = path.stat().st_mtime
+    except OSError:
         return
-    cw, ch = canvas.size
-    r = ov["out"]
-    bw, bh = r["w"] * cw, r["h"] * ch
-    scale = min(bw / img.width, bh / img.height)  # fit inside the rectangle, keep aspect
-    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
-    img = img.resize(size, Image.LANCZOS)
-    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    layer.paste(img, (round(r["x"] * cw + (bw - size[0]) / 2), round(r["y"] * ch + (bh - size[1]) / 2)))
-    _composite(canvas, layer, ov, ov.get("_tilt_box", 0.0))
+    rect = _rect_px(canvas, ov)
+    pivot = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)
+    _composite(canvas, _image_piece, (str(path), mtime, rect), 0, pivot,
+               ov.get("rotation", 0) + ov.get("_tilt_box", 0.0))
 
 
 @functools.lru_cache(maxsize=256)
@@ -615,11 +684,22 @@ def wobble_pose(ov: dict, seed: int, step: int) -> dict:
             "_tilt_text": tilt if target in ("all", "text") else 0.0}
 
 
+# the cached fonts and pieces are shared: one thread draws at a time (the GUI
+# prepares the next video's overlays while ffmpeg renders, and may run a preview)
+_DRAW_LOCK = threading.RLock()
+
+
 def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None,
                     step: int = 0):
     """Overlays on a transparent RGBA image of `size`, or None. By default all the
     layout's visible ones (GIFs/videos as their first frame, animated ones at wobble
     half-step `step`, for previews); `items` are drawn exactly as given."""
+    with _DRAW_LOCK:
+        return _render_overlays(layout, values, size, items, step)
+
+
+def _render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None,
+                     step: int):
     if items is None:
         if not layout.get("overlays_enabled"):
             return None
@@ -640,8 +720,11 @@ def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: li
     return canvas
 
 
-def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, list[str]]:
+def overlay_layers(layout: dict, values: dict, tmp_prefix: Path,
+                   still: bool = False) -> tuple[list, list[str]]:
     """Split one video's overlays into ffmpeg layers, keeping their stacking order.
+    still=True (a single-frame preview) draws animated texts/stills in their first
+    pose instead of preparing every pose.
 
     Returns (layers, input args): one layer per extra input (1, 2, ...) - None for a
     full-canvas PNG of consecutive texts/stills, {"anim", "x", "y"} for the looped
@@ -659,25 +742,35 @@ def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, 
         img = render_overlays(layout, values, size, run) if run else None
         if img is not None and img.getbbox() is not None:
             png = tmp_prefix.with_name(f"{tmp_prefix.name}_{len(layers)}.png")
-            img.save(png)
+            img.save(png, compress_level=1)
             layers.append(None)
             inputs.extend(["-i", str(png)])
         run.clear()
 
     def add_wobble(ov: dict, seed: int) -> None:
-        # one frame per half-step, so an "apart" text can change between the box's poses
-        poses = [render_overlays(layout, values, size, [wobble_pose(ov, seed, p)])
-                 for p in range(2 * ANIM_POSES)]
-        boxes = [img.getbbox() for img in poses if img is not None and img.getbbox()]
+        # one frame per half-step only for an "apart" text (its letters change between
+        # the box's poses); anything else changes once per pose
+        apart = ov["type"] == "text" and ov.get("anim_target") == "apart"
+        steps = range(2 * ANIM_POSES) if apart else range(0, 2 * ANIM_POSES, 2)
+        drawn: dict = {}  # repeated poses share their image
+        poses = []
+        for p in steps:
+            posed = wobble_pose(ov, seed, p)
+            key = (posed.get("_tilt_box"), posed.get("_tilt_text"))
+            if key not in drawn:
+                drawn[key] = render_overlays(layout, values, size, [posed])
+            poses.append(drawn[key])
+        boxes = [b for b in (img.getbbox() for img in drawn.values() if img is not None) if b]
         if not boxes:
             return  # e.g. a {title} text on a video without a title
         x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
         x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
         pattern = tmp_prefix.with_name(f"{tmp_prefix.name}_{len(layers)}_%02d.png")
-        for p, img in enumerate(poses):
-            img.crop((x0, y0, x1, y1)).save(str(pattern) % p)
+        for p, img in enumerate(poses):  # temp files: fast compression beats small
+            img.crop((x0, y0, x1, y1)).save(str(pattern) % p, compress_level=1)
         layers.append({"anim": True, "x": x0, "y": y0})
-        inputs.extend(["-loop", "1", "-framerate", str(2 * ANIM_FPS), "-i", str(pattern)])
+        inputs.extend(["-loop", "1", "-framerate", str(len(poses) // ANIM_POSES * ANIM_FPS),
+                       "-i", str(pattern)])
 
     for seed, ov in enumerate(layout["overlays"]):
         if not ov["visible"]:
@@ -687,21 +780,23 @@ def overlay_layers(layout: dict, values: dict, tmp_prefix: Path) -> tuple[list, 
                 flush()
                 layers.append({**ov, "seed": seed})
                 inputs.extend(["-stream_loop", "-1", "-i", ov["path"]])
-        elif ov.get("animate"):
+        elif ov.get("animate") and not still:
             flush()
             add_wobble(ov, seed)
         else:
-            run.append(ov)
+            run.append(wobble_pose(ov, seed, 0))
     flush()
     return layers, inputs
 
 
-def filter_for_video(layout: dict | None, values: dict, tmp_prefix: Path) -> tuple[str, list[str]]:
+def filter_for_video(layout: dict | None, values: dict, tmp_prefix: Path,
+                     still: bool = False) -> tuple[str, list[str]]:
     """Filter graph for one video (built-in CONFIG when layout is None) + the extra
-    ffmpeg input args its overlays need (PNG files are written next to tmp_prefix)."""
+    ffmpeg input args its overlays need (PNG files are written next to tmp_prefix).
+    still=True for single-frame previews (see overlay_layers)."""
     if layout is None:
         return build_filter_complex(), []
-    layers, inputs = overlay_layers(layout, values, tmp_prefix)
+    layers, inputs = overlay_layers(layout, values, tmp_prefix, still)
     return build_filter_complex_from_layout(layout, layers), inputs
 
 

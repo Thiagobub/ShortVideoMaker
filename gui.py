@@ -25,6 +25,7 @@ import tempfile
 import threading
 import tkinter as tk
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -507,34 +508,41 @@ class App:
         if at is None:
             return
         src = paths[0]
-        tmp = Path(tempfile.mkdtemp(prefix="shorts_preview_"))
-        out = self.output_dir()
-        out.mkdir(parents=True, exist_ok=True)
-        cmds = []
         try:
-            for stem, layout in self.selected_layouts():
-                fc, extra = ms.filter_for_video(layout, self.texts_for(src), tmp / stem)
-                dst = out / f"{src.stem}_{stem}_preview_{at:g}s.png"
-                cmds.append((dst, ms.build_preview_cmd(self.ffmpeg, src, dst, fc, at, extra)))
+            layouts = self.selected_layouts()
         except Exception as exc:
-            shutil.rmtree(tmp, ignore_errors=True)
             messagebox.showerror("Layout", str(exc))
             return
-        if not cmds:
-            shutil.rmtree(tmp, ignore_errors=True)
+        if not layouts:
             messagebox.showinfo("Prévia", "Marque pelo menos um layout em Saídas.")
             return
-        self.log(f"[prévia] {src.name} @ {at:g}s ({len(cmds)} layout(s))")
+        out = self.output_dir()
+        out.mkdir(parents=True, exist_ok=True)
+        texts = self.texts_for(src)
+        self.log(f"[prévia] {src.name} @ {at:g}s ({len(layouts)} layout(s))")
 
         def run() -> None:
-            for dst, cmd in cmds:
+            """Off the UI thread: draw the overlays (first wobble pose only - it's a
+            single frame), then one ffmpeg per layout, all at once."""
+            tmp = Path(tempfile.mkdtemp(prefix="shorts_preview_"))
+            procs = []
+            for stem, layout in layouts:
+                dst = out / f"{src.stem}_{stem}_preview_{at:g}s.png"
                 dst.unlink(missing_ok=True)
-                result = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                                        stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
-                if result.returncode == 0 and dst.exists():
+                try:
+                    fc, extra = ms.filter_for_video(layout, texts, tmp / stem, still=True)
+                    cmd = ms.build_preview_cmd(self.ffmpeg, src, dst, fc, at, extra)
+                    procs.append((dst, subprocess.Popen(
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                        errors="replace", stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)))
+                except Exception as exc:
+                    self.events.put(("log", f"[prévia falhou] {stem}: {exc}"))
+            for dst, proc in procs:
+                _, err = proc.communicate()
+                if proc.returncode == 0 and dst.exists():
                     self.events.put(("open", dst))
                 else:
-                    tail = "\n".join(result.stderr.strip().splitlines()[-8:])
+                    tail = "\n".join(err.strip().splitlines()[-8:])
                     self.events.put(("log", f"[prévia falhou] {dst.name}\n{tail}"))
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -592,14 +600,21 @@ class App:
         """Worker thread: renders jobs one by one, reports through self.events."""
         done = failed = 0
         tmp = Path(tempfile.mkdtemp(prefix="shorts_overlay_"))
+
+        def prepare(n: int, src: Path, texts: dict) -> list[tuple[Path, str, list[str]]]:
+            return [(out_dir / f"{src.stem}_{stem}.mp4",
+                     *ms.filter_for_video(layout, texts, tmp / f"{n}_{stem}"))
+                    for stem, layout in layouts]
+
+        # the overlays (every wobble pose of every layout) are drawn ahead, video
+        # by video, on another thread: from the 2nd video on ffmpeg starts right away
+        pool = ThreadPoolExecutor(max_workers=1)
+        ready = [pool.submit(prepare, n, src, texts) for n, (_, src, texts, _) in enumerate(jobs)]
         for n, (iid, src, texts, trim) in enumerate(jobs):
             if self.cancel.is_set():
                 break
-            outputs = []
             try:
-                for stem, layout in layouts:
-                    fc, extra = ms.filter_for_video(layout, texts, tmp / f"{n}_{stem}")
-                    outputs.append((out_dir / f"{src.stem}_{stem}.mp4", fc, extra))
+                outputs = ready[n].result()
             except Exception as exc:
                 self.events.put(("log", f"[erro]   textos/imagens de {src.name}: {exc}"))
                 failed += 1
@@ -624,6 +639,7 @@ class App:
             else:
                 failed += 1
                 self.events.put(("status", iid, ST_FAILED))
+        pool.shutdown(wait=True, cancel_futures=True)  # before deleting its files
         shutil.rmtree(tmp, ignore_errors=True)
         self.events.put(("finished", done, failed, len(jobs)))
 

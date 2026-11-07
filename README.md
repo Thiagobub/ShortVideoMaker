@@ -72,7 +72,10 @@ machine — **NVIDIA** (`h264_nvenc`), then **AMD** (`h264_amf`), then **Intel**
 (`h264_qsv`) — and falls back to the **CPU** (`libx264`) when none does. Each one is
 checked with a tiny test encode at startup, since being compiled into ffmpeg doesn't
 mean the hardware is present. If a GPU render fails anyway, that video is retried on the
-CPU automatically. `CRF` / `PRESET` are mapped to each encoder's closest equivalent.
+CPU automatically. `CRF` / `PRESET` are mapped to each encoder's closest equivalent
+(GPU quality = `CRF + 5`, which gives files about the size of x264's). With a GPU
+encoder the gameplay is also decoded on the GPU (`-hwaccel d3d11va`), and the background
+blur is always done on a downscaled frame, which looks the same but costs far less.
 The filters (crop, scale, blur) still run on the CPU, so the speedup depends on the
 layout.
 
@@ -85,11 +88,29 @@ python gui.py      # or: pythonw gui.py (no console window on Windows)
 ```
 
 A small window over the same pipeline: lists the videos in `./input` (add more with
-*Adicionar…*), picks a layout file, renders with per-video and overall progress, can
-cancel (the half-written output is deleted), renders a single test frame (*Prévia*),
-opens the layout editor and the output folder. The *Título* / *Crédito* columns hold each
-video's `{title}` and `{credit}` (double-click a row to edit them; saved to
-`input/titles.json`). The *Aceleração* dropdown shows the
+*Adicionar…*), renders with per-video and overall progress, can cancel (half-written
+outputs are deleted), renders a single test frame per layout (*Prévia*), opens the layout
+editor (*Editar layout ▾*, which also creates new layouts) and the output folder.
+
+*Saídas* has a checkbox per saved layout (`*.json` in the project folder): every ticked one
+is rendered as its own file, `<video>_<layout>.mp4` (e.g. `clip_youtube.mp4` and
+`clip_tiktok.mp4`). They come out of a single ffmpeg run per video, which decodes the
+gameplay once and encodes the outputs side by side (up to 4 per run), so two layouts take
+noticeably less than twice the time of one. If that combined run fails, the layouts are
+retried one at a time, then on the CPU. The ticks are remembered in `input/gui_settings.json`.
+
+The *Título* / *Crédito* / *Trecho* columns hold each video's `{title}`, `{credit}` and an
+optional start/end (`83` or `1:23`; blank = whole video). Double-click a row to edit them;
+they are saved to `input/titles.json` and the trim applies to every render of that video.
+
+*Juntar selecionados* puts the selected videos one after the other in a single short, in
+list order (move rows with ↑ ↓), each cut to its own trim: `<first video>_juntado_<layout>.mp4`
+for every ticked layout. Each clip goes through the layout separately (so clips of
+different resolutions or frame rates mix fine; one without audio gets silence), then the
+texts/images of the first video's title/credit are laid over the whole joined video, so
+they stay in place across the cut and GIFs keep looping.
+
+The *Aceleração* dropdown shows the
 encoders detected on this machine (`Auto → …` names the one it picked) and lets you
 choose another; GPU failures fall back to the CPU the same way. With no rows selected, *Renderizar*
 processes every row that isn't done yet; with a selection, only those.
@@ -124,7 +145,7 @@ so you can verify a layout on paper before encoding whole videos.
 | **Selected box** | Exact `x y w h` fractions for the source crop and the output placement, plus `visible` and `keep crop aspect` (output height follows the crop's shape — matches `scale=W:-2`). |
 | **Background & output** | Blurred-background on/off, zoom, blur, output canvas size, CRF, x264 preset. |
 | **Render exact frame** | Renders the current frame through the **real** ffmpeg filter graph (~1 s) and shows it next to the command — the live preview approximates the blur, this is pixel-exact. |
-| **Texts & images** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image` add more; drag their dashed rectangles on the preview. Pick any installed Windows font (or a `.ttf` with `…` / in `./fonts`), size, text color, box color, outline and alignment. `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
+| **Texts & images** | Tick *this layout has texts / images* to put a title, a credit line or a logo on top of the short (the first tick adds a credit + title pair to start from; unticking keeps them but stops drawing them). `+ Text` / `+ Image` add more; drag their dashed rectangles on the preview. Pick a font from the dropdown: the ones you drop in `./fonts` come first, one block per subfolder (e.g. `./fonts/deadlock/` shows as *deadlock › radiance-bold*), then the installed Windows fonts; `…` picks any other `.ttf`/`.otf` file. Then size, text color, box color, outline, alignment and rotation (*rotate°*: slider, exact degrees, or `0°` to reset; texts and images alike). `{title}` and `{credit}` are filled per video; the *preview* fields only drive the editor preview. |
 | **Save layout** | Writes the JSON. It is used automatically next time you render (or pass `--layout`). |
 
 Interactions: drag inside a box to move it, drag its corner/edge handles to resize,
@@ -164,9 +185,9 @@ built-in `CONFIG` numbers, scaled to the first video you load.
   "overlays": [
     { "type": "text", "visible": true, "text": "CREDIT: {credit}", "font": "impact.ttf",
       "size": 0.03, "color": "#000000", "bg_enabled": true, "bg": "#FFFFFF",
-      "outline": false, "align": "center",
+      "outline": false, "align": "center", "rotation": 0,
       "out": { "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.06 } },
-    { "type": "image", "visible": true, "path": "logo.png",
+    { "type": "image", "visible": true, "path": "logo.png", "rotation": -8,
       "out": { "x": 0.6, "y": 0.82, "w": 0.35, "h": 0.1 } }
   ]
   ```
@@ -174,6 +195,8 @@ built-in `CONFIG` numbers, scaled to the first video you load.
   A text wraps to its rectangle's width and shrinks (from `size`, a fraction of the output
   height) until it fits; `{title}` / `{credit}` come from `input/titles.json`, and a text
   whose variable is empty for a video is skipped. An image is fitted inside its rectangle.
+  `rotation` (degrees clockwise, -180..180, default 0) turns the finished text or image
+  around the center of its rectangle, so a turned item can poke out of the rectangle.
   Texts and still images are drawn with Pillow into transparent PNGs laid over the video,
   so rendering a layout with overlays needs Pillow too.
 - An `image` whose `path` is a **GIF or a video** is animated: ffmpeg loops it

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import io
+import math
 import re
 import subprocess
 import sys
@@ -201,10 +202,7 @@ class LayoutEditor:
 
         self.selected = -1
         self.ov_selected = -1                    # selected text/image (-1 = a box or nothing)
-        self.fonts = ms.system_fonts()           # display name -> font file
-        self.font_names = {}                     # font file -> display name
-        for name, file in self.fonts.items():
-            self.font_names.setdefault(file.lower(), name)
+        self._load_fonts()
         self._ov_kind_shown: str | None = None   # which field set is on screen
         self.drag: dict | None = None
         self.left_map = (0, 0, 0, 0)     # (x0, y0, w, h) of the frame on the canvas
@@ -474,7 +472,8 @@ class LayoutEditor:
         e.bind("<KeyRelease>", self._on_ov_field)
         ToolTip(e, "{title} and {credit} are replaced by each video's values (typed in gui.py)")
         ttk.Label(f, text="font").grid(row=1, column=0, sticky="w")
-        cb = ttk.Combobox(f, textvariable=self.var_ov_font, state="readonly", values=list(self.fonts))
+        cb = ttk.Combobox(f, textvariable=self.var_ov_font, state="readonly", values=self.font_choices,
+                          height=25)
         cb.grid(row=1, column=1, sticky="ew", pady=1)
         cb.bind("<<ComboboxSelected>>", self._on_ov_field)
         btn = ttk.Button(f, text="…", width=3, command=self.pick_font_file)
@@ -519,9 +518,28 @@ class LayoutEditor:
         self.lbl_ov_path = ttk.Label(f, text="", foreground="#888")
         self.lbl_ov_path.pack(side="left")
 
+        # rotation, for texts and images alike (shown when anything is selected)
+        f = self.ov_rot_frame = ttk.Frame(grp)
+        f.columnconfigure(1, weight=1)
+        self.var_ov_rot = tk.DoubleVar(value=0.0)
+        self.var_ov_rot_text = tk.StringVar(value="0")
+        ttk.Label(f, text="rotate°").grid(row=0, column=0, sticky="w")
+        ttk.Scale(f, from_=-180, to=180, variable=self.var_ov_rot,
+                  command=lambda v: self._on_ov_rotation(float(v))).grid(
+            row=0, column=1, sticky="ew", padx=4)
+        sb = ttk.Spinbox(f, from_=-180, to=180, increment=1, width=5, justify="right",
+                         textvariable=self.var_ov_rot_text,
+                         command=lambda: self._on_ov_rotation(self.var_ov_rot_text.get()))
+        sb.grid(row=0, column=2)
+        for seq in ("<Return>", "<FocusOut>"):
+            sb.bind(seq, lambda _e: self._on_ov_rotation(self.var_ov_rot_text.get()))
+        ToolTip(sb, "Degrees clockwise, around the center of the rectangle")
+        ttk.Button(f, text="0°", width=3, command=lambda: self._on_ov_rotation(0)).grid(
+            row=0, column=3, padx=(4, 0))
+
         # sample values: only for this preview, each video gets its own in gui.py
         sample = ttk.Frame(grp)
-        sample.grid(row=4, column=0, sticky="ew", padx=6, pady=(4, 6))
+        sample.grid(row=5, column=0, sticky="ew", padx=6, pady=(4, 6))
         self.var_sample_title = tk.StringVar(value="NOW THIS IS SCIENCE")
         self.var_sample_credit = tk.StringVar(value="CREATOR")
         ttk.Label(sample, text="preview {title}").pack(side="left")
@@ -532,6 +550,29 @@ class LayoutEditor:
         e = ttk.Entry(sample, textvariable=self.var_sample_credit, width=10)
         e.pack(side="left", padx=2)
         e.bind("<KeyRelease>", lambda _e: self.draw_right())
+
+    def _load_fonts(self) -> None:
+        """Font dropdown: the fonts in ./fonts first, one block per subfolder
+        ("deadlock › radiance-bold"), then the installed ones, each block under a
+        header line (picking a header changes nothing)."""
+        self.fonts: dict[str, str] = {}       # display name -> font (file name or ./fonts path)
+        self.font_names: dict[str, str] = {}  # font, lowercased -> display name
+        self.font_choices: list[str] = []     # dropdown lines, headers included
+        groups = [(f"{group}  (./{ms.FONTS_DIR}"
+                   + ("" if group == "fonts" else f"/{group}") + ")",
+                   {f"{group} › {name}": path for name, path in fonts.items()})
+                  for group, fonts in ms.custom_fonts()]
+        groups.append(("Windows" if sys.platform == "win32" else "system", ms.system_fonts()))
+        for title, fonts in groups:
+            if not fonts:
+                continue
+            self.font_choices.append(f"──── {title} ────")
+            for name, font in fonts.items():
+                self.fonts[name] = font
+                self.font_choices.append(name)
+                self.font_names.setdefault(font.lower(), name)
+                # layouts that name a ./fonts file by its bare file name show the same entry
+                self.font_names.setdefault(Path(font).name.lower(), name)
 
     # ---------------------------------------------------- videos/time
     def open_video(self) -> None:
@@ -958,6 +999,8 @@ class LayoutEditor:
         ov["visible"] = bool(self.var_ov_visible.get())
         if ov["type"] == "text":
             ov["text"] = self.var_ov_text.get()
+            if self.var_ov_font.get() not in self.fonts:  # a group header
+                set_if_changed(self.var_ov_font, self.font_names.get(ov["font"].lower(), ov["font"]))
             ov["font"] = self.fonts.get(self.var_ov_font.get(), ov["font"])
             try:
                 ov["size"] = float(self.var_ov_size.get()) / self.layout["output"]["height"]
@@ -969,6 +1012,22 @@ class LayoutEditor:
         if ov != before:
             self._after_edit()
 
+    def _on_ov_rotation(self, value) -> None:
+        ov = self.current_overlay()
+        if ov is None:
+            return
+        try:
+            angle = float(value)
+        except (TypeError, ValueError):
+            self._sync_overlay_fields()  # typed garbage: show the current value again
+            return
+        angle = round((angle + 180) % 360 - 180)
+        if angle != ov.get("rotation", 0):
+            ov["rotation"] = angle
+            self._after_edit()
+        else:
+            self._sync_overlay_fields()
+
     def _sync_overlay_fields(self) -> None:
         self.var_ov_on.set(self.layout["overlays_enabled"])
         ov = self.current_overlay()
@@ -976,6 +1035,9 @@ class LayoutEditor:
         if kind != self._ov_kind_shown:  # swap the field set only when it changes
             self.ov_text_frame.grid_remove()
             self.ov_image_frame.grid_remove()
+            self.ov_rot_frame.grid_remove()
+            if kind is not None:
+                self.ov_rot_frame.grid(row=4, column=0, sticky="ew", padx=6, pady=(4, 0))
             if kind == "text":
                 self.ov_text_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
             elif kind == "image":
@@ -984,6 +1046,9 @@ class LayoutEditor:
         if ov is None:
             return
         self.var_ov_visible.set(ov["visible"])
+        rotation = ov.get("rotation", 0)
+        set_if_changed(self.var_ov_rot, float(rotation))
+        set_if_changed(self.var_ov_rot_text, f"{rotation:g}")
         if kind == "image":
             self.lbl_ov_path.configure(text=ov["path"] or "(no file)")
             return
@@ -1269,6 +1334,14 @@ class LayoutEditor:
             selected = i == self.ov_selected
             c.create_rectangle(x, y, x + w, y + h, outline=OVERLAY_COLOR, dash=(4, 3),
                                width=2 if selected else 1, tags="ovl")
+            if ov.get("rotation"):  # the turned outline, around the rectangle's center
+                a = math.radians(ov["rotation"])
+                cx, cy = x + w / 2, y + h / 2
+                corners = []
+                for dx, dy in ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2)):
+                    corners += [cx + dx * math.cos(a) - dy * math.sin(a),
+                                cy + dx * math.sin(a) + dy * math.cos(a)]
+                c.create_polygon(corners, outline=OVERLAY_COLOR, fill="", dash=(2, 4), tags="ovl")
             if selected:
                 self._draw_handles(c, x, y, w, h, OVERLAY_COLOR)
 

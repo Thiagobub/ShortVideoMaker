@@ -5,8 +5,8 @@ backup/
 converted/
 published/
 
-# local layout tuning (personal per-machine settings)
-layout.json
+# local layouts (personal per-machine settings): every *.json in the project folder
+/*.json
 
 # python
 __pycache__/

@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import os
 import re
 import shutil
@@ -128,11 +129,24 @@ def find_ffmpeg() -> str | None:
         return None
 
 
+def blurred_bg(width: int, height: int, zoom: float, blur: float) -> str:
+    """Filter chain for the zoomed "cover" background, blurred.
+    A heavy blur wipes out fine detail anyway, so it is done on a frame shrunk
+    by up to 8x (with the sigma shrunk to match) and scaled back up: it looks
+    the same and is far cheaper than blurring the full 1080x1920 frame."""
+    f = max(1, min(8, int(blur // 6)))
+    w, h = even(width / f), even(height / f)
+    chain = (f"scale={even(w * zoom)}:{even(h * zoom)}:force_original_aspect_ratio=increase,"
+             f"crop={w}:{h}")
+    if blur > 0:
+        chain += f",gblur=sigma={num(blur / f)}"
+    if f > 1:
+        chain += f",scale={width}:{height}"
+    return chain
+
+
 def build_filter_complex() -> str:
     """Build the ffmpeg filter graph from the CONFIG numbers."""
-    # background: zoomed-in "cover" fit of the whole canvas, then blurred
-    bg_w, bg_h = even(OUTPUT_W * BG_ZOOM), even(OUTPUT_H * BG_ZOOM)
-
     # main panel geometry on the output canvas
     main_w = even(OUTPUT_W * MAIN_WIDTH_PCT)
     main_h = main_w / MAIN_ASPECT
@@ -158,8 +172,7 @@ def build_filter_complex() -> str:
 
     return (
         f"[0:v]split=3[bg_in][main_in][items_in];"
-        f"[bg_in]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
-        f"crop={OUTPUT_W}:{OUTPUT_H},gblur=sigma={num(BG_BLUR)}[bg];"
+        f"[bg_in]{blurred_bg(OUTPUT_W, OUTPUT_H, BG_ZOOM, BG_BLUR)}[bg];"
         f"[main_in]{main_crop},scale={main_w}:-2[main];"
         f"[items_in]{items_crop},scale={items_w}:-2[items];"
         f"[bg][main]overlay=x={main_x}:y={main_y}[tmp];"
@@ -302,6 +315,8 @@ def normalize_overlay(raw: dict, i: int) -> dict:
         "type": kind,
         "visible": bool(raw.get("visible", True)),
         "out": {"x": clamp01(r.get("x", 0)), "y": clamp01(r.get("y", 0)), "w": w, "h": h},
+        # degrees clockwise around the rectangle's center, kept in -180..180
+        "rotation": (float(raw.get("rotation", 0)) + 180) % 360 - 180,
     }
     if kind == "image":
         ov["path"] = str(raw.get("path", ""))
@@ -355,11 +370,27 @@ def resolve_font(name: str) -> Path | None:
     for d in font_dirs():
         if (d / name).exists():
             return d / name
-    return None
+    # ./fonts may be organized in subfolders (e.g. fonts/deadlock/)
+    return next(Path(FONTS_DIR).rglob(name), None) if Path(FONTS_DIR).is_dir() else None
+
+
+def custom_fonts() -> list[tuple[str, dict[str, str]]]:
+    """The fonts dropped in ./fonts, grouped by subfolder: [(group, {display name ->
+    project-relative path})], loose files first under "fonts". The path keeps the
+    layout pointing at this exact file even if an installed font has the same name."""
+    root = Path(FONTS_DIR)
+    groups: dict[str, dict[str, str]] = {}
+    if root.is_dir():
+        for f in sorted(root.rglob("*"), key=lambda p: p.as_posix().lower()):
+            if f.suffix.lower() in FONT_EXTS:
+                rel = f.parent.relative_to(root).as_posix()
+                group = "fonts" if rel == "." else rel
+                groups.setdefault(group, {})[f.stem] = f.as_posix()
+    return sorted(groups.items(), key=lambda kv: (kv[0] != "fonts", kv[0].lower()))
 
 
 def system_fonts() -> dict[str, str]:
-    """Display name -> font file name, for the installed fonts plus ./fonts."""
+    """Display name -> font file name, for the fonts installed on this machine."""
     fonts: dict[str, str] = {}
     if sys.platform == "win32":
         import winreg
@@ -375,7 +406,7 @@ def system_fonts() -> dict[str, str]:
                     if isinstance(file, str) and Path(file).suffix.lower() in FONT_EXTS:
                         fonts[re.sub(r"\s*\((TrueType|OpenType)\)$", "", name)] = Path(file).name
     for d in font_dirs():
-        if d.is_dir() and (d == Path(FONTS_DIR) or sys.platform != "win32"):
+        if d.is_dir() and d != Path(FONTS_DIR) and sys.platform != "win32":
             for f in d.rglob("*"):
                 if f.suffix.lower() in FONT_EXTS:
                     fonts.setdefault(f.stem, f.name)
@@ -422,6 +453,19 @@ def _wrap(draw, text: str, font, width: float) -> list[str]:
                 line = test
         lines.append(line)
     return lines
+
+
+def _composite(canvas, layer, ov: dict) -> None:
+    """Lay one overlay's full-canvas layer on the canvas, turned by its rotation
+    around the center of its rectangle (the content is laid out unrotated first)."""
+    from PIL import Image
+
+    if ov.get("rotation"):
+        cw, ch = canvas.size
+        r = ov["out"]
+        center = ((r["x"] + r["w"] / 2) * cw, (r["y"] + r["h"] / 2) * ch)
+        layer = layer.rotate(-ov["rotation"], resample=Image.BICUBIC, center=center)
+    canvas.alpha_composite(layer)
 
 
 def _draw_text(canvas, ov: dict, values: dict) -> None:
@@ -471,7 +515,7 @@ def _draw_text(canvas, ov: dict, values: dict) -> None:
             lx = x0 + pad + (inner_w - lw) / 2
         draw.text((lx + stroke, y0 + pad + i * line_h), line, font=font, fill=ov["color"],
                   stroke_width=stroke, stroke_fill="#000000")
-    canvas.alpha_composite(layer)
+    _composite(canvas, layer, ov)
 
 
 def is_media(ov: dict) -> bool:
@@ -520,7 +564,7 @@ def _draw_image(canvas, ov: dict) -> None:
     img = img.resize(size, Image.LANCZOS)
     layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     layer.paste(img, (round(r["x"] * cw + (bw - size[0]) / 2), round(r["y"] * ch + (bh - size[1]) / 2)))
-    canvas.alpha_composite(layer)
+    _composite(canvas, layer, ov)
 
 
 def render_overlays(layout: dict, values: dict, size: tuple[int, int], items: list | None = None):
@@ -617,72 +661,88 @@ def save_layout(path: Path, layout: dict) -> None:
     path.write_text(json.dumps(normalize_layout(layout), indent=2) + "\n", encoding="utf-8")
 
 
-def build_filter_complex_from_layout(layout: dict, layers: list | None = None) -> str:
-    """Build the ffmpeg filter graph from a layout dict (see default_layout).
-    `layers` describes extra inputs 1, 2, ... laid on top in order (see overlay_layers)."""
+def _layout_parts(layout: dict, src: str = "0:v", tag: str = "") -> tuple[list[str], str]:
+    """Background + boxes of a layout, fed by [src]. Every label gets the `tag`
+    prefix (so several copies can share one graph); returns (parts, last label)."""
     out = layout["output"]
     width, height = even(out["width"]), even(out["height"])
     boxes = [b for b in layout["boxes"] if b.get("visible", True)]
     bg = layout["background"]
 
     # one stream per layer: the background plus every visible box
-    sources = ["bg_in"] + [f"b{i}_in" for i in range(len(boxes))]
+    sources = [f"{tag}bg_in"] + [f"{tag}b{i}_in" for i in range(len(boxes))]
     parts: list[str] = []
     if len(sources) == 1:
-        parts.append("[0:v]null[bg_in]")
+        parts.append(f"[{src}]null[{tag}bg_in]")
     else:
-        parts.append(f"[0:v]split={len(sources)}" + "".join(f"[{s}]" for s in sources))
+        parts.append(f"[{src}]split={len(sources)}" + "".join(f"[{s}]" for s in sources))
 
     # background: zoomed-in "cover" fit of the whole canvas, then blurred
-    # (or plain black when disabled - still driven by [0:v] so timing matches)
+    # (or plain black when disabled - still driven by the source so timing matches)
     if bg["enabled"]:
-        bg_w, bg_h = even(width * bg["zoom"]), even(height * bg["zoom"])
-        parts.append(
-            f"[bg_in]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},gblur=sigma={num(bg['blur'])}[bg]"
-        )
+        parts.append(f"[{tag}bg_in]{blurred_bg(width, height, bg['zoom'], bg['blur'])}[{tag}bg]")
     else:
-        parts.append(f"[bg_in]scale={width}:{height},lutrgb=r=0:g=0:b=0[bg]")
+        parts.append(f"[{tag}bg_in]scale={width}:{height},lutrgb=r=0:g=0:b=0[{tag}bg]")
 
     # every box: crop from the source (fractions of iw/ih), scale to its
     # output rectangle (or keep the crop's aspect when keep_aspect is set)
     for i, box in enumerate(boxes):
-        src, dst = box["src"], box["out"]
+        src_box, dst = box["src"], box["out"]
         crop = (
-            f"crop=w=min(floor(iw*{num(src['w'])}/2)*2\\,floor(iw/2)*2)"
-            f":h=min(floor(ih*{num(src['h'])}/2)*2\\,floor(ih/2)*2)"
-            f":x=min(round(iw*{num(src['x'])}/2)*2\\,iw-ow)"
-            f":y=min(round(ih*{num(src['y'])}/2)*2\\,ih-oh)"
+            f"crop=w=min(floor(iw*{num(src_box['w'])}/2)*2\\,floor(iw/2)*2)"
+            f":h=min(floor(ih*{num(src_box['h'])}/2)*2\\,floor(ih/2)*2)"
+            f":x=min(round(iw*{num(src_box['x'])}/2)*2\\,iw-ow)"
+            f":y=min(round(ih*{num(src_box['y'])}/2)*2\\,ih-oh)"
         )
         out_w = even(width * dst["w"])
         scale = f"scale={out_w}:-2" if box.get("keep_aspect") else f"scale={out_w}:{even(height * dst['h'])}"
-        parts.append(f"[b{i}_in]{crop},{scale},setsar=1[b{i}]")
+        parts.append(f"[{tag}b{i}_in]{crop},{scale},setsar=1[{tag}b{i}]")
 
     # stack the boxes on the background, in list order
-    prev = "bg"
+    prev = f"{tag}bg"
     for i, box in enumerate(boxes):
         dst = box["out"]
-        label = "tmp" if i < len(boxes) - 1 else "stacked"
+        label = f"{tag}tmp{i}" if i < len(boxes) - 1 else f"{tag}stacked"
         x, y = even(width * dst["x"]), even(height * dst["y"])
-        parts.append(f"[{prev}][b{i}]overlay=x={x}:y={y}[{label}]")
+        parts.append(f"[{prev}][{tag}b{i}]overlay=x={x}:y={y}[{label}]")
         prev = label
+    return parts, prev
 
-    # texts/images (a full-canvas PNG) and looped GIFs/videos (fitted in their rect)
-    for k, ov in enumerate(layers or [], start=1):
+
+def _overlay_parts(layout: dict, prev: str, layers: list, first_input: int = 1) -> list[str]:
+    """Lay the overlay layers (extra inputs first_input, first_input + 1, ...) on
+    [prev]: texts/images are a full-canvas PNG, looped GIFs/videos are fitted in
+    their rect. Ends in [vout]."""
+    out = layout["output"]
+    width, height = even(out["width"]), even(out["height"])
+    parts: list[str] = []
+    for k, ov in enumerate(layers, start=first_input):
         if ov is None:
             parts.append(f"[{prev}][{k}:v]overlay=x=0:y=0[l{k}]")
         else:
             r = ov["out"]
             bw, bh = even(width * r["w"]), even(height * r["h"])
             x, y = round(width * r["x"]), round(height * r["y"])
+            # rotated: the frame grows to fit the turned picture (transparent corners);
+            # the overlay below stays centered on the rectangle either way
+            rad = num(math.radians(ov.get("rotation", 0)))
+            turn = (f"format=rgba,rotate={rad}:ow=rotw({rad}):oh=roth({rad}):c=none,"
+                    if ov.get("rotation") else "")
             parts.append(f"[{k}:v]scale=w={bw}:h={bh}:force_original_aspect_ratio=decrease,"
-                         f"setsar=1[m{k}]")
+                         f"{turn}setsar=1[m{k}]")
             # shortest=1: the endlessly looped input stops when the gameplay does
             parts.append(f"[{prev}][m{k}]overlay=x={x}+({bw}-overlay_w)/2"
                          f":y={y}+({bh}-overlay_h)/2:shortest=1[l{k}]")
         prev = f"l{k}"
     parts.append(f"[{prev}]setsar=1[vout]")
-    return ";".join(parts)
+    return parts
+
+
+def build_filter_complex_from_layout(layout: dict, layers: list | None = None) -> str:
+    """Build the ffmpeg filter graph from a layout dict (see default_layout).
+    `layers` describes extra inputs 1, 2, ... laid on top in order (see overlay_layers)."""
+    parts, prev = _layout_parts(layout)
+    return ";".join(parts + _overlay_parts(layout, prev, layers or []))
 # ======================================================================
 
 
@@ -695,16 +755,23 @@ _NVENC_PRESETS = {
 }
 
 
+# GPU encoders spend more bits than x264 for the same number: at CQ = CRF an
+# NVENC file came out ~2x bigger with no visible gain, CQ = CRF + 5 matched
+# x264's size. AMF's QP is assumed to behave alike (not measured).
+_GPU_Q_OFFSET = 5
+
+
 def encoder_args(encoder: str, crf: int = CRF, preset: str = PRESET) -> list[str]:
     """Video codec options for an ENCODERS key, mapping CRF/preset to its closest equivalent."""
     if encoder == "nvidia":
         return ["-c:v", "h264_nvenc", "-preset", _NVENC_PRESETS.get(preset, "p5"),
-                "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+                "-rc", "vbr", "-cq", str(crf + _GPU_Q_OFFSET), "-b:v", "0", "-pix_fmt", "yuv420p"]
     if encoder == "amd":
         quality = ("speed" if preset in ("ultrafast", "superfast", "veryfast", "faster")
                    else "quality" if preset in ("slow", "slower", "veryslow") else "balanced")
+        qp = str(crf + _GPU_Q_OFFSET)
         return ["-c:v", "h264_amf", "-quality", quality, "-rc", "cqp",
-                "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf), "-pix_fmt", "yuv420p"]
+                "-qp_i", qp, "-qp_p", qp, "-qp_b", qp, "-pix_fmt", "yuv420p"]
     if encoder == "intel":
         qsv_preset = preset if preset not in ("ultrafast", "superfast") else "veryfast"
         return ["-c:v", "h264_qsv", "-preset", qsv_preset, "-global_quality", str(crf),
@@ -736,14 +803,119 @@ def detect_encoders(ffmpeg: str) -> list[str]:
     return [e for e, ok in zip(GPU_ORDER, works) if ok] + ["cpu"]
 
 
+def decode_args(encoder: str) -> list[str]:
+    """Decode the gameplay on the GPU too when encoding on it: big 1440p/4K
+    sources cost as much to decode as the rest of the filter graph. d3d11va
+    works on NVIDIA, AMD and Intel; ffmpeg falls back to the CPU on its own
+    when the codec isn't supported, and the CPU retry doesn't use it at all."""
+    if encoder == "cpu":
+        return []
+    return ["-hwaccel", "d3d11va" if sys.platform == "win32" else "auto"]
+
+
+def trim_args(start: float = 0.0, end: float | None = None) -> list[str]:
+    """Input options that keep only start..end (seconds) of the next input."""
+    args = ["-ss", f"{start:g}"] if start > 0 else []
+    if end is not None:
+        args += ["-t", f"{max(0.0, end - start):g}"]
+    return args
+
+
 def build_render_cmd(ffmpeg: str, src: Path, dst: Path, fc: str, encoder: str = "cpu",
-                     extra_inputs: list[str] | None = None) -> list[str]:
+                     extra_inputs: list[str] | None = None,
+                     trim: tuple[float, float | None] = (0.0, None)) -> list[str]:
     return [
         ffmpeg, "-y", "-hide_banner",
+        *decode_args(encoder),
+        *trim_args(*trim),
         "-i", str(src),
         *(extra_inputs or []),
         "-filter_complex", fc,
         "-map", "[vout]", "-map", "0:a?",
+        *encoder_args(encoder),
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(dst),
+    ]
+
+
+_LABEL_RE = re.compile(r"\[(?:(\d+):v|([A-Za-z_]\w*))\]")
+
+
+def merge_filter_graphs(graphs: list[tuple[str, list[str]]]) -> tuple[str, list[str]]:
+    """Join several (filter graph, extra inputs) pairs into one graph that decodes
+    the gameplay once and splits it: output i ends in [o{i}vout]. Each graph's
+    labels get an o{i} prefix and its extra inputs are renumbered after the others'."""
+    parts = [f"[0:v]split={len(graphs)}" + "".join(f"[o{i}src]" for i in range(len(graphs)))]
+    inputs: list[str] = []
+    for i, (fc, extra) in enumerate(graphs):
+        offset = inputs.count("-i")  # inputs taken by the graphs before this one
+
+        def relabel(m: re.Match, i=i, offset=offset) -> str:
+            if m.group(1) is None:
+                return f"[o{i}{m.group(2)}]"
+            k = int(m.group(1))
+            return f"[o{i}src]" if k == 0 else f"[{k + offset}:v]"
+
+        parts.append(_LABEL_RE.sub(relabel, fc))
+        inputs += extra
+    return ";".join(parts), inputs
+
+
+def build_multi_render_cmd(ffmpeg: str, src: Path, outputs: list[tuple[Path, str, list[str]]],
+                           encoder: str = "cpu",
+                           trim: tuple[float, float | None] = (0.0, None)) -> list[str]:
+    """Render one video into several layouts at once: outputs = [(dst, fc, extra_inputs)].
+    The source is decoded once and every output is encoded in parallel."""
+    if len(outputs) == 1:
+        dst, fc, extra = outputs[0]
+        return build_render_cmd(ffmpeg, src, dst, fc, encoder, extra, trim)
+    fc, extra = merge_filter_graphs([(fc, extra) for _, fc, extra in outputs])
+    cmd = [ffmpeg, "-y", "-hide_banner", *decode_args(encoder), *trim_args(*trim),
+           "-i", str(src), *extra, "-filter_complex", fc]
+    for i, (dst, _, _) in enumerate(outputs):
+        cmd += ["-map", f"[o{i}vout]", "-map", "0:a?", *encoder_args(encoder),
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dst)]
+    return cmd
+
+
+def probe_media(ffmpeg: str, path: Path) -> tuple[float, bool]:
+    """(duration in seconds, has an audio stream), read from ffmpeg's own banner
+    so ffprobe isn't needed. Duration is 0 when it can't be read."""
+    result = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)], capture_output=True,
+                            text=True, errors="replace", stdin=subprocess.DEVNULL,
+                            creationflags=NO_WINDOW)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    duration = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else 0.0
+    return duration, re.search(r"Stream #0:\d+.*: Audio:", result.stderr) is not None
+
+
+def build_join_cmd(ffmpeg: str, clips: list[tuple[Path, float, float, bool]], layout: dict,
+                   layers: list, extra_inputs: list[str], dst: Path,
+                   encoder: str = "cpu") -> list[str]:
+    """Several clips, one after the other, in one short. clips = [(path, start,
+    end, has_audio)]: each clip goes through the layout on its own (so sources
+    of different sizes are fine), they are concatenated, and only then the
+    overlays go on top, so texts stay put and GIFs keep looping across the cuts.
+    Clips without audio get silence so the concat lines up."""
+    n = len(clips)
+    cmd = [ffmpeg, "-y", "-hide_banner"]
+    parts: list[str] = []
+    for i, (path, start, end, has_audio) in enumerate(clips):
+        cmd += [*decode_args(encoder), *trim_args(start, end), "-i", str(path)]
+        clip_parts, last = _layout_parts(layout, f"{i}:v", f"c{i}_")
+        parts += clip_parts
+        parts.append(f"[{last}]setsar=1,format=yuv420p[c{i}v]")
+        if has_audio:
+            parts.append(f"[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo[c{i}a]")
+        else:
+            parts.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={end - start:g}[c{i}a]")
+    parts.append("".join(f"[c{i}v][c{i}a]" for i in range(n)) + f"concat=n={n}:v=1:a=1[joined][aout]")
+    parts += _overlay_parts(layout, "joined", layers, first_input=n)
+    return cmd + [
+        *extra_inputs,
+        "-filter_complex", ";".join(parts),
+        "-map", "[vout]", "-map", "[aout]",
         *encoder_args(encoder),
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
